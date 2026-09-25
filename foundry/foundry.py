@@ -3,7 +3,7 @@ import logging
 from typing import Tuple
 
 import aiohttp
-from redbot.core import Config, commands
+from redbot.core import Config, app_commands, commands
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import box
 
@@ -81,6 +81,7 @@ class Foundry(commands.Cog):
 
     @commands.hybrid_group(name="foundry")
     @commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
     async def foundry(self, ctx: commands.Context) -> None:
         """Foundry VTT maintenance tasks."""
 
