@@ -1,0 +1,11 @@
+{
+    "author": ["Jay"],
+    "name": "RoleGate",
+    "short": "Button role panel with admin approval for gated roles.",
+    "description": "Members pick roles from a button panel. Open roles are granted instantly; approval roles post a request card to a private channel where moderators with Manage Roles approve or deny it. Members can always remove their own roles. Buttons keep working across restarts.",
+    "install_msg": "Set up with [p]rolegate channel #approvals, then [p]rolegate add @Role [approval|open] [label] for each role, then [p]rolegate post [#channel]. The bot needs the Manage Roles permission, and its own role must sit above every role it hands out.",
+    "requirements": [],
+    "tags": ["roles", "buttons", "approval", "utility"],
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog stores Discord user IDs for pending role requests only. They are removed once a request is approved or denied."
+}
