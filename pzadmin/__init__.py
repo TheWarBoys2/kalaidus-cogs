@@ -2,7 +2,10 @@ from redbot.core.bot import Red
 
 from .pzadmin import PZAdmin
 
-__red_end_user_data_statement__ = "This cog does not store any end user data."
+__red_end_user_data_statement__ = (
+    "This cog stores which channels belong to which server. Mod requests send the requester's "
+    "Discord username and ID to your PZAdmin, which keeps them with the request."
+)
 
 
 async def setup(bot: Red) -> None:

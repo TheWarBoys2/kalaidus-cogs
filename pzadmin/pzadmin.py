@@ -3,7 +3,7 @@ import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
 import discord
@@ -22,6 +22,9 @@ CONFIRM_TIMEOUT = 30
 MAX_REASON = 200
 MAX_EMBED_DESC = 4000
 MAX_FIELD = 1000
+MAX_NOTE = 300  # PZAdmin's limit on a mod request note
+MAX_REQUESTED_BY = 100
+WORKSHOP_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id={}"
 NO_MENTIONS = discord.AllowedMentions.none()
 
 STATE_ICONS = {
@@ -36,6 +39,11 @@ STATE_ICONS = {
 
 class PZAdminError(Exception):
     """An error with a message that is safe to show in Discord."""
+
+    def __init__(self, message: str, status: Optional[int] = None, data: Any = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.data = data if isinstance(data, dict) else {}
 
 
 def _icon(server: Dict[str, Any]) -> str:
@@ -117,6 +125,8 @@ class PZAdmin(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=1262570563, force_registration=True)
         self.config.register_global(base_url=None)
+        # channel ID -> {"id": PZAdmin server ID, "name": its name when linked}
+        self.config.register_guild(channels={})
         self._session: Optional[aiohttp.ClientSession] = None
         self._cache: List[Dict[str, Any]] = []
         self._cache_time = 0.0
@@ -163,7 +173,7 @@ class PZAdmin(commands.Cog):
                 if resp.status < 400:
                     return data
                 error = data.get("error") if isinstance(data, dict) else None
-                raise PZAdminError(self._error_message(resp, error))
+                raise PZAdminError(self._error_message(resp, error), status=resp.status, data=data)
         except asyncio.TimeoutError:
             raise PZAdminError(f"PZAdmin didn't answer within {int(timeout)} seconds.") from None
         except aiohttp.ClientError as e:
@@ -379,6 +389,88 @@ class PZAdmin(commands.Cog):
     ) -> List[app_commands.Choice[str]]:
         return await self._server_autocomplete(interaction, current)
 
+    # ---------- mod requests ----------
+
+    @staticmethod
+    def _link_key(channel: Any) -> str:
+        """Threads (and forum posts) count as their parent channel."""
+        if isinstance(channel, discord.Thread) and channel.parent_id:
+            return str(channel.parent_id)
+        return str(channel.id)
+
+    @pz.command(name="request")
+    @commands.cooldown(1, 30, commands.BucketType.user)
+    @app_commands.describe(
+        workshop="Steam Workshop link or ID of the mod",
+        note="Optional note for the admins, e.g. why you want it",
+    )
+    async def pz_request(self, ctx: commands.Context, workshop: str, *, note: Optional[str] = None) -> None:
+        """Request a mod for this channel's server. An admin approves it in PZAdmin."""
+        links = await self.config.guild(ctx.guild).channels()
+        link = links.get(self._link_key(ctx.channel))
+        if not link:
+            ctx.command.reset_cooldown(ctx)
+            await ctx.send("This channel isn't linked to a server, so I don't know where the mod would go. "
+                           "Ask in your server's channel.")
+            return
+
+        name = discord.utils.escape_markdown(str(link.get("name") or link["id"]))
+        who = _truncate(f"{ctx.author.name} ({ctx.author.id})", MAX_REQUESTED_BY)
+        body: Dict[str, Any] = {"workshopId": workshop.strip().strip("<>"), "requestedBy": who}
+        if note:
+            body["note"] = note.strip()[:MAX_NOTE]
+
+        async with ctx.typing():  # PZAdmin asks Steam about the item, which can take a few seconds
+            try:
+                data = await self._request("POST", f"/servers/{link['id']}/mod-requests", json=body)
+            except PZAdminError as e:
+                ctx.command.reset_cooldown(ctx)
+                log.info("pz request %r on %s by %s: refused (%s)", body["workshopId"], link["id"], who, e)
+                await ctx.send(self._request_error(e, name), allowed_mentions=NO_MENTIONS)
+                return
+
+        req = data.get("request") if isinstance(data, dict) else None
+        req = req if isinstance(req, dict) else {}
+        ws_id = str(req.get("workshopId") or body["workshopId"])
+        title = req.get("title") or f"Workshop item {ws_id}"
+        log.info("pz request %s on %s by %s: taken", ws_id, link["id"], who)
+        embed = discord.Embed(
+            title=_truncate(str(title), 256),
+            url=WORKSHOP_URL.format(ws_id) if ws_id.isdigit() else None,
+            description=f"Requested for **{name}** by {ctx.author.mention}. An admin will approve or reject it.",
+            colour=await ctx.embed_colour(),
+        )
+        mod_ids = req.get("modIds") or []
+        if mod_ids:
+            embed.add_field(name="Mod IDs", value=_truncate(", ".join(str(m) for m in mod_ids), MAX_FIELD))
+        if req.get("note"):
+            embed.add_field(name="Note", value=_truncate(str(req["note"]), MAX_FIELD), inline=False)
+        await ctx.send(embed=embed, allowed_mentions=NO_MENTIONS)
+
+    @staticmethod
+    def _request_error(e: PZAdminError, name: str) -> str:
+        if e.status == 409:
+            reason = e.data.get("reason")
+            if reason == "installed":
+                return f"That mod is already on **{name}**."
+            if reason == "duplicate":
+                existing = e.data.get("request") if isinstance(e.data.get("request"), dict) else {}
+                by = existing.get("requestedBy")
+                by = f" by {discord.utils.escape_markdown(str(by))}" if by else ""
+                return f"That mod has already been requested{by} for **{name}** and is waiting for an admin."
+            if reason == "full":
+                return f"**{name}** has too many requests waiting already. Try again once an admin has gone through them."
+        if e.status == 400:
+            detail = str(e.data.get("error") or "")
+            if "Steam" in detail or "Project Zomboid" in detail:  # no such item, or not a PZ mod
+                return f"That didn't work: {_truncate(detail, 200)}."
+            return "That doesn't look like a Workshop mod. Send its Workshop link or numeric ID."
+        if e.status == 403:
+            return "The bot's PZAdmin key isn't allowed to make mod requests. The bot owner needs to give it the request scope."
+        if e.status == 404:
+            return f"PZAdmin doesn't know **{name}** any more. The bot owner needs to relink this channel."
+        return str(e)
+
     # ---------- control commands ----------
 
     @commands.hybrid_group(name="pzctl")
@@ -494,6 +586,61 @@ class PZAdmin(commands.Cog):
         await self.config.base_url.set(url)
         self._cache, self._cache_time = [], 0.0
         await ctx.send(f"PZAdmin URL set to `{url}`.")
+
+    @pzadminset.command(name="link")
+    @commands.guild_only()
+    async def pzadminset_link(
+        self,
+        ctx: commands.Context,
+        channel: Union[discord.TextChannel, discord.ForumChannel, discord.VoiceChannel],
+        *,
+        server: str,
+    ) -> None:
+        """Link a channel to a server, so `pz request` there asks for mods on that server.
+
+        Threads in the channel count too. Linking a channel again replaces its server.
+        """
+        async with ctx.typing():
+            try:
+                s = await self._resolve(server)
+            except PZAdminError as e:
+                await ctx.send(str(e), allowed_mentions=NO_MENTIONS)
+                return
+        name = str(s.get("name") or s["id"])
+        async with self.config.guild(ctx.guild).channels() as links:
+            links[str(channel.id)] = {"id": str(s["id"]), "name": name}
+        await ctx.send(
+            f"{channel.mention} is now linked to **{discord.utils.escape_markdown(name)}**.",
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    @pzadminset.command(name="unlink")
+    @commands.guild_only()
+    async def pzadminset_unlink(
+        self, ctx: commands.Context, channel: Union[discord.TextChannel, discord.ForumChannel, discord.VoiceChannel]
+    ) -> None:
+        """Stop a channel taking mod requests."""
+        async with self.config.guild(ctx.guild).channels() as links:
+            removed = links.pop(str(channel.id), None)
+        if removed:
+            await ctx.send(f"{channel.mention} is no longer linked to a server.", allowed_mentions=NO_MENTIONS)
+        else:
+            await ctx.send(f"{channel.mention} wasn't linked to a server.", allowed_mentions=NO_MENTIONS)
+
+    @pzadminset.command(name="links")
+    @commands.guild_only()
+    async def pzadminset_links(self, ctx: commands.Context) -> None:
+        """List which channels take mod requests for which server."""
+        links = await self.config.guild(ctx.guild).channels()
+        if not links:
+            await ctx.send("No channels are linked yet. Use `pzadminset link #channel <server>`.")
+            return
+        lines = []
+        for channel_id, link in links.items():
+            channel = ctx.guild.get_channel(int(channel_id))
+            where = channel.mention if channel else f"deleted channel {channel_id}"
+            lines.append(f"{where} \N{RIGHTWARDS ARROW} {discord.utils.escape_markdown(str(link.get('name') or link['id']))}")
+        await ctx.send(_truncate("\n".join(lines), 1900), allowed_mentions=NO_MENTIONS)
 
     @pzadminset.command(name="show")
     async def pzadminset_show(self, ctx: commands.Context) -> None:
