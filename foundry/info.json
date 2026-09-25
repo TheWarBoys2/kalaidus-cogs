@@ -1,0 +1,11 @@
+{
+    "author": ["Jay"],
+    "name": "Foundry",
+    "short": "Foundry VTT maintenance tasks via OliveTin.",
+    "description": "Lets approved users trigger predefined Foundry VTT maintenance actions (like fixing file permissions) through an OliveTin instance. The bot never runs commands itself; it only asks OliveTin to run actions by ID.",
+    "install_msg": "Set up with [p]foundryset url <olivetin url>, then DM the bot: [p]set api olivetin api_key,<key>",
+    "requirements": [],
+    "tags": ["foundry", "olivetin", "homelab"],
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog does not store any end user data."
+}

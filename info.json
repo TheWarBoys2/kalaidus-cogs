@@ -1,0 +1,7 @@
+{
+    "author": ["Jay"],
+    "name": "kalaidus-cogs",
+    "short": "Custom cogs for the Kalaidus homelab.",
+    "description": "Custom Red-DiscordBot cogs for the Kalaidus homelab.",
+    "install_msg": "Kalaidus cogs added. Install individual cogs with [p]cog install."
+}
