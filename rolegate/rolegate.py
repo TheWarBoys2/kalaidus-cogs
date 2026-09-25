@@ -14,7 +14,7 @@ log = logging.getLogger("red.kalaidus.rolegate")
 MAX_ROLES = 25
 MAX_LABEL = 80
 MAX_DESCRIPTION = 150
-MAX_EMBED_DESCRIPTION = 4096
+MAX_EMBED_TOTAL = 6000
 LOCK_EMOJI = "\N{LOCK}"
 NO_MENTIONS = discord.AllowedMentions.none()
 DANGEROUS_PERMS = (
@@ -46,12 +46,17 @@ class RoleButton(
 ):
     """Panel button. The role ID lives in the custom_id, so it survives restarts."""
 
-    def __init__(self, role_id: int, label: Optional[str] = None, gated: bool = True) -> None:
+    def __init__(
+        self, role_id: int, label: Optional[str] = None, gated: bool = True, emoji: Optional[str] = None
+    ) -> None:
+        # A button holds one emoji. With a custom emoji, the lock moves into the label.
+        if emoji and gated and label:
+            label = f"{label} {LOCK_EMOJI}"
         super().__init__(
             discord.ui.Button(
                 label=label,
-                emoji=LOCK_EMOJI if gated else None,
-                style=discord.ButtonStyle.primary if gated else discord.ButtonStyle.secondary,
+                emoji=emoji or (LOCK_EMOJI if gated else None),
+                style=discord.ButtonStyle.secondary,
                 custom_id=f"rolegate:req:{role_id}",
             )
         )
@@ -122,7 +127,7 @@ class RoleGate(commands.Cog):
         self.config = Config.get_conf(self, identifier=1262570562, force_registration=True)
         self.config.register_guild(
             approval_channel=None,
-            roles={},  # "<role_id>": {"mode": "approval"|"open", "label": str, "description": str}
+            roles={},  # "<role_id>": {"mode", "label", "description", "emoji"}
             panel={},  # {"channel_id": int, "message_id": int, "title": str}
             pending={},  # "<user_id>:<role_id>": {"channel_id": int, "message_id": int}
         )
@@ -164,33 +169,43 @@ class RoleGate(commands.Cog):
             return True
         return isinstance(user, discord.Member) and user.guild_permissions.manage_roles
 
-    async def _build_panel(self, guild: discord.Guild, title: str):
+    async def _build_panel(self, channel: discord.abc.GuildChannel, title: str):
+        guild = channel.guild
         roles = await self.config.guild(guild).roles()
         view = discord.ui.View(timeout=None)
-        lines = []
-        blurbs = []
+        embed = discord.Embed(
+            title=title,
+            description="Click a button below to get a role. Click it again to remove it.",
+            colour=await self.bot.get_embed_colour(channel),
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        fields = []
+        any_gated = False
         for role_id, entry in roles.items():
             role = guild.get_role(int(role_id))
             if role is None:
                 continue
             gated = entry["mode"] == "approval"
-            view.add_item(RoleButton(role.id, entry["label"], gated))
-            lines.append(f"{LOCK_EMOJI + ' ' if gated else ''}**{entry['label']}**: {role.mention}")
-            blurbs.append(entry.get("description"))
+            any_gated |= gated
+            emoji = entry.get("emoji") or None
+            view.add_item(RoleButton(role.id, entry["label"], gated, emoji))
+            name = f"{emoji + ' ' if emoji else ''}{entry['label']}{' ' + LOCK_EMOJI if gated else ''}"
+            fields.append((name, entry.get("description") or ""))
 
-        footer = (
-            f"\n\nClick a button to get that role. Roles marked {LOCK_EMOJI} need a "
-            "moderator to approve your request first; you'll get a DM with the result. "
-            "Click a role you already have to remove it."
-        )
-        with_blurbs = [f"{line}\n> {blurb}" if blurb else line for line, blurb in zip(lines, blurbs)]
-        description = "\n".join(with_blurbs) + footer
-        if len(description) > MAX_EMBED_DESCRIPTION:
+        if not fields:
+            embed.description = "No roles are set up yet."
+        if any_gated:
+            embed.set_footer(text=f"{LOCK_EMOJI} Needs a moderator's approval. You'll get a DM with the result.")
+
+        for name, value in fields:
+            embed.add_field(name=name, value=value or "\u200b", inline=False)
+        if len(embed) > MAX_EMBED_TOTAL:
             log.warning("Panel for guild %s too long with descriptions; leaving them out", guild.id)
-            description = "\n".join(lines) + footer
-        if not lines:
-            description = "No roles are set up yet."
-        embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
+            embed.clear_fields()
+            for name, _ in fields:
+                embed.add_field(name=name, value="\u200b", inline=False)
         return embed, view
 
     # ---------- panel clicks ----------
@@ -445,11 +460,7 @@ class RoleGate(commands.Cog):
             if label is None:
                 label = existing["label"] if existing else role.name
             mode = mode or "approval"
-            roles[str(role.id)] = {
-                "mode": mode,
-                "label": label[:MAX_LABEL],
-                "description": existing.get("description", "") if existing else "",
-            }
+            roles[str(role.id)] = {**(existing or {}), "mode": mode, "label": label[:MAX_LABEL]}
 
         msg = f"{'Updated' if existing else 'Added'} **{role.name}** as `{mode}` with label **{label[:MAX_LABEL]}**."
         risky = [p for p in DANGEROUS_PERMS if getattr(role.permissions, p)]
@@ -486,6 +497,30 @@ class RoleGate(commands.Cog):
             f"Run `{ctx.clean_prefix}rolegate refresh` to update the posted panel."
         )
 
+    @rolegate.command(name="emoji")
+    async def rolegate_emoji(self, ctx: commands.Context, role: discord.Role, emoji: Optional[str] = None) -> None:
+        """Set the emoji shown on a role's button and panel entry.
+
+        Use a normal emoji or one from this server. Leave it out to clear it.
+        """
+        async with self.config.guild(ctx.guild).roles() as roles:
+            entry = roles.get(str(role.id))
+            if entry is None:
+                await ctx.send(f"That role isn't on the panel. Add it first with `{ctx.clean_prefix}rolegate add`.")
+                return
+            if emoji:
+                # Discord is the only reliable judge of what counts as an emoji: try reacting with it.
+                try:
+                    await ctx.message.add_reaction(emoji)
+                except discord.HTTPException:
+                    await ctx.send("That doesn't look like an emoji I can use. Try a normal emoji or one from this server.")
+                    return
+                with contextlib.suppress(discord.HTTPException):
+                    await ctx.message.remove_reaction(emoji, ctx.guild.me)
+            entry["emoji"] = emoji or ""
+        verb = f"Set the emoji for **{entry['label']}** to {emoji}" if emoji else f"Cleared the emoji for **{entry['label']}**"
+        await ctx.send(f"{verb}. Run `{ctx.clean_prefix}rolegate refresh` to update the posted panel.")
+
     @rolegate.command(name="remove")
     async def rolegate_remove(self, ctx: commands.Context, role: Union[discord.Role, int]) -> None:
         """Remove a role from the panel (accepts a role or a role ID)."""
@@ -509,7 +544,8 @@ class RoleGate(commands.Cog):
             role = ctx.guild.get_role(int(role_id))
             where = role.mention if role else f"deleted role `{role_id}`"
             lock = LOCK_EMOJI + " " if entry["mode"] == "approval" else ""
-            lines.append(f"{lock}**{entry['label']}**: {where} (`{entry['mode']}`)")
+            emoji = entry["emoji"] + " " if entry.get("emoji") else ""
+            lines.append(f"{lock}{emoji}**{entry['label']}**: {where} (`{entry['mode']}`)")
             if entry.get("description"):
                 lines.append(f"> {entry['description']}")
         if not data["roles"]:
@@ -530,7 +566,7 @@ class RoleGate(commands.Cog):
         if not await self.config.guild(ctx.guild).roles():
             await ctx.send(f"Add some roles first with `{ctx.clean_prefix}rolegate add`.")
             return
-        embed, view = await self._build_panel(ctx.guild, title)
+        embed, view = await self._build_panel(channel, title)
         try:
             message = await channel.send(embed=embed, view=view, allowed_mentions=NO_MENTIONS)
         except discord.HTTPException as e:
@@ -550,7 +586,7 @@ class RoleGate(commands.Cog):
         if channel is None:
             await ctx.send(f"No panel found. Post one with `{ctx.clean_prefix}rolegate post`.")
             return
-        embed, view = await self._build_panel(ctx.guild, panel.get("title", "Pick your roles"))
+        embed, view = await self._build_panel(channel, panel.get("title", "Pick your roles"))
         try:
             message = await channel.fetch_message(panel["message_id"])
             await message.edit(embed=embed, view=view, allowed_mentions=NO_MENTIONS)
