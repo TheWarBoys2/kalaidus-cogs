@@ -13,6 +13,8 @@ log = logging.getLogger("red.kalaidus.rolegate")
 
 MAX_ROLES = 25
 MAX_LABEL = 80
+MAX_DESCRIPTION = 150
+MAX_EMBED_DESCRIPTION = 4096
 LOCK_EMOJI = "\N{LOCK}"
 NO_MENTIONS = discord.AllowedMentions.none()
 DANGEROUS_PERMS = (
@@ -120,7 +122,7 @@ class RoleGate(commands.Cog):
         self.config = Config.get_conf(self, identifier=1262570562, force_registration=True)
         self.config.register_guild(
             approval_channel=None,
-            roles={},  # "<role_id>": {"mode": "approval"|"open", "label": str}
+            roles={},  # "<role_id>": {"mode": "approval"|"open", "label": str, "description": str}
             panel={},  # {"channel_id": int, "message_id": int, "title": str}
             pending={},  # "<user_id>:<role_id>": {"channel_id": int, "message_id": int}
         )
@@ -166,6 +168,7 @@ class RoleGate(commands.Cog):
         roles = await self.config.guild(guild).roles()
         view = discord.ui.View(timeout=None)
         lines = []
+        blurbs = []
         for role_id, entry in roles.items():
             role = guild.get_role(int(role_id))
             if role is None:
@@ -173,14 +176,20 @@ class RoleGate(commands.Cog):
             gated = entry["mode"] == "approval"
             view.add_item(RoleButton(role.id, entry["label"], gated))
             lines.append(f"{LOCK_EMOJI + ' ' if gated else ''}**{entry['label']}**: {role.mention}")
+            blurbs.append(entry.get("description"))
 
-        description = "\n".join(lines) or "No roles are set up yet."
-        if lines:
-            description += (
-                f"\n\nClick a button to get that role. Roles marked {LOCK_EMOJI} need a "
-                "moderator to approve your request first; you'll get a DM with the result. "
-                "Click a role you already have to remove it."
-            )
+        footer = (
+            f"\n\nClick a button to get that role. Roles marked {LOCK_EMOJI} need a "
+            "moderator to approve your request first; you'll get a DM with the result. "
+            "Click a role you already have to remove it."
+        )
+        with_blurbs = [f"{line}\n> {blurb}" if blurb else line for line, blurb in zip(lines, blurbs)]
+        description = "\n".join(with_blurbs) + footer
+        if len(description) > MAX_EMBED_DESCRIPTION:
+            log.warning("Panel for guild %s too long with descriptions; leaving them out", guild.id)
+            description = "\n".join(lines) + footer
+        if not lines:
+            description = "No roles are set up yet."
         embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
         return embed, view
 
@@ -436,7 +445,11 @@ class RoleGate(commands.Cog):
             if label is None:
                 label = existing["label"] if existing else role.name
             mode = mode or "approval"
-            roles[str(role.id)] = {"mode": mode, "label": label[:MAX_LABEL]}
+            roles[str(role.id)] = {
+                "mode": mode,
+                "label": label[:MAX_LABEL],
+                "description": existing.get("description", "") if existing else "",
+            }
 
         msg = f"{'Updated' if existing else 'Added'} **{role.name}** as `{mode}` with label **{label[:MAX_LABEL]}**."
         risky = [p for p in DANGEROUS_PERMS if getattr(role.permissions, p)]
@@ -447,6 +460,31 @@ class RoleGate(commands.Cog):
             )
         msg += f"\nRun `{ctx.clean_prefix}rolegate refresh` to update the posted panel."
         await ctx.send(msg, allowed_mentions=NO_MENTIONS)
+
+    @rolegate.command(name="describe")
+    async def rolegate_describe(
+        self, ctx: commands.Context, role: discord.Role, *, description: Optional[str] = None
+    ) -> None:
+        """Set a short description shown under a role on the panel.
+
+        Leave the description out to clear it.
+        """
+        if description:
+            description = " ".join(description.split())
+        if description and len(description) > MAX_DESCRIPTION:
+            await ctx.send(f"Keep it to {MAX_DESCRIPTION} characters (that one is {len(description)}).")
+            return
+        async with self.config.guild(ctx.guild).roles() as roles:
+            entry = roles.get(str(role.id))
+            if entry is None:
+                await ctx.send(f"That role isn't on the panel. Add it first with `{ctx.clean_prefix}rolegate add`.")
+                return
+            entry["description"] = description or ""
+        verb = "Set" if description else "Cleared"
+        await ctx.send(
+            f"{verb} the description for **{entry['label']}**. "
+            f"Run `{ctx.clean_prefix}rolegate refresh` to update the posted panel."
+        )
 
     @rolegate.command(name="remove")
     async def rolegate_remove(self, ctx: commands.Context, role: Union[discord.Role, int]) -> None:
@@ -472,6 +510,8 @@ class RoleGate(commands.Cog):
             where = role.mention if role else f"deleted role `{role_id}`"
             lock = LOCK_EMOJI + " " if entry["mode"] == "approval" else ""
             lines.append(f"{lock}**{entry['label']}**: {where} (`{entry['mode']}`)")
+            if entry.get("description"):
+                lines.append(f"> {entry['description']}")
         if not data["roles"]:
             lines.append("No roles configured.")
         for page in pagify("\n".join(lines)):
