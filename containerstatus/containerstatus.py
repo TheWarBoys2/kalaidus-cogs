@@ -45,6 +45,7 @@ COLOUR_DOWN = 0xC4553F
 COLOUR_UNKNOWN = 0x8A8272
 COLOUR_UPDATE = 0x4A8FD4
 FOOTER = "Updated via Arcane"
+PZADMIN_FOOTER = "Updated by PZAdmin"  # PZAdmin's own live status cards
 
 # Status dots in channel names, working the same way as the pzadmin cog's.
 DOT_PREFIX = re.compile(
@@ -243,7 +244,8 @@ class ContainerStatus(commands.Cog):
         # description, link, link_label, environment}. A card without an
         # environment reads the default one.
         # dots: channel ID -> card ID whose status goes at the start of its name
-        self.config.register_global(environment=DEFAULT_ENVIRONMENT, cards={}, next_id=1, dots={})
+        # ignored: channel IDs setup and autosetup leave alone
+        self.config.register_global(environment=DEFAULT_ENVIRONMENT, cards={}, next_id=1, dots={}, ignored=[])
         self._session: Optional[aiohttp.ClientSession] = None
         self._task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
@@ -438,6 +440,7 @@ class ContainerStatus(commands.Cog):
             if channel_id not in dots:
                 del self._dots[channel_id]
         now = time.monotonic()
+        pz_dots: Dict[int, set] = {}
         for channel_id, card_id in dots.items():
             dot = wanted.get(card_id)
             if dot is None:
@@ -445,6 +448,11 @@ class ContainerStatus(commands.Cog):
             channel = self.bot.get_channel(channel_id)
             if channel is None:
                 continue
+            guild = channel.guild
+            if guild.id not in pz_dots:
+                pz_dots[guild.id] = await self._pz_dot_channels(guild)
+            if str(channel_id) in pz_dots[guild.id]:
+                continue  # the pzadmin cog owns this channel's name
             ds = self._dots.get(channel_id)
             if ds is None:
                 match = DOT_PREFIX.match(channel.name)
@@ -642,6 +650,42 @@ class ContainerStatus(commands.Cog):
         except Exception:
             return set()
 
+    async def _pz_reason(self, channel: discord.TextChannel) -> Optional[str]:
+        """Why a channel belongs to PZAdmin or was set aside, or None if it's free to set up."""
+        if channel.id in await self.config.ignored():
+            return "ignored"
+        pz = self.bot.get_cog("PZAdmin")
+        if pz is not None:
+            try:
+                conf = await pz.config.guild(channel.guild).all()
+            except Exception:
+                conf = {}
+            if str(channel.id) in (conf.get("status_channels") or {}):
+                return "the pzadmin cog puts a dot here"
+            if str(channel.id) in (conf.get("channels") or {}):
+                return "linked to a PZAdmin server"
+        # PZAdmin's own live status card, posted through a webhook or its bot.
+        try:
+            async for message in channel.history(limit=50):
+                for embed in message.embeds:
+                    if (embed.footer.text or "").startswith(PZADMIN_FOOTER):
+                        return "PZAdmin posts its own status card here"
+        except (discord.HTTPException, AttributeError):
+            pass  # can't read history: nothing to go on
+        return None
+
+    async def _confirm(self, ctx: commands.Context, question: str) -> bool:
+        await ctx.send(f"{question} Type `yes` within {CONFIRM_TIMEOUT} seconds.")
+        try:
+            reply = await self.bot.wait_for(
+                "message",
+                check=lambda m: m.author.id == ctx.author.id and m.channel.id == ctx.channel.id,
+                timeout=CONFIRM_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return False
+        return reply.content.strip().lower() in ("yes", "y")
+
     # ---------- matching channels to containers ----------
 
     async def _all_containers(self) -> List[Tuple[str, Optional[str], str]]:
@@ -711,6 +755,13 @@ class ContainerStatus(commands.Cog):
         The container defaults to the one the channel is named after.
         Examples: `!containercard setup #jellyfin`, `!containercard setup #photos immich_server`
         """
+        reason = await self._pz_reason(channel)
+        if reason:
+            await ctx.send(
+                f"Leaving {channel.mention} alone: {reason}. `!containercard add` still works if you really want a card there.",
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
         async with ctx.typing():
             try:
                 if container:
@@ -733,6 +784,101 @@ class ContainerStatus(commands.Cog):
                 return
         await ctx.send(f"{channel.mention} \N{RIGHTWARDS ARROW} `{name}`: {result}.", allowed_mentions=NO_MENTIONS)
 
+    @containercard.command(name="ignore")
+    async def cc_ignore(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None) -> None:
+        """Keep setup and autosetup out of a channel. With no channel, list the ignored ones."""
+        if channel is None:
+            ignored = await self.config.ignored()
+            if not ignored:
+                await ctx.send("No channels are ignored. Channels PZAdmin uses are left alone anyway.")
+                return
+            names = []
+            for cid in ignored:
+                ch = self.bot.get_channel(int(cid))
+                names.append(ch.mention if ch else f"deleted channel {cid}")
+            await ctx.send(_truncate("Ignored: " + ", ".join(names), 1900), allowed_mentions=NO_MENTIONS)
+            return
+        async with self.config.ignored() as ignored:
+            if channel.id not in ignored:
+                ignored.append(channel.id)
+        await ctx.tick()
+
+    @containercard.command(name="unignore")
+    async def cc_unignore(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
+        """Let setup and autosetup use a channel again."""
+        async with self.config.ignored() as ignored:
+            if channel.id in ignored:
+                ignored.remove(channel.id)
+        await ctx.tick()
+
+    @containercard.command(name="cleanup")
+    async def cc_cleanup(self, ctx: commands.Context) -> None:
+        """Remove this cog's cards and dots from channels PZAdmin already covers (or you've ignored).
+
+        Shows what it would remove first. Channel names are left as they are,
+        since PZAdmin may be the one showing the dot.
+        """
+        cards = await self.config.cards()
+        dots = await self.config.dots()
+        found: List[Tuple[str, Any, str]] = []  # (kind, id, line)
+        seen: Dict[int, Optional[str]] = {}
+        async with ctx.typing():
+
+            async def reason_for(channel_id: int) -> Optional[str]:
+                if channel_id not in seen:
+                    channel = self.bot.get_channel(channel_id)
+                    seen[channel_id] = await self._pz_reason(channel) if channel else None
+                return seen[channel_id]
+
+            for card_id, card in sorted(cards.items(), key=lambda kv: int(kv[0])):
+                reason = await reason_for(int(card["channel_id"]))
+                if reason:
+                    title = card.get("title") or card["container"]
+                    found.append(("card", card_id, f"card {card_id} ({title}) in <#{card['channel_id']}>: {reason}"))
+            for channel_id in dots:
+                reason = await reason_for(int(channel_id))
+                if reason:
+                    found.append(("dot", channel_id, f"dot in <#{channel_id}>: {reason}"))
+        if not found:
+            await ctx.send("Nothing to clean up: none of my cards or dots are in channels PZAdmin covers.")
+            return
+        await ctx.send(
+            _truncate("I'll remove:\n" + "\n".join(line for _, _, line in found), 1800), allowed_mentions=NO_MENTIONS
+        )
+        if not await self._confirm(ctx, f"Remove these {len(found)}?"):
+            await ctx.send("Nothing removed.")
+            return
+        failed = []
+        async with ctx.typing():
+            async with self.config.dots() as stored:
+                for kind, key, _ in found:
+                    if kind == "dot":
+                        stored.pop(key, None)
+                        self._dots.pop(int(key), None)
+            for kind, key, _ in found:
+                if kind != "card":
+                    continue
+                async with self._lock:
+                    async with self.config.cards() as stored:
+                        card = stored.pop(key, None)
+                    async with self.config.dots() as stored_dots:
+                        for channel_id in [c for c, cid in stored_dots.items() if str(cid) == key]:
+                            del stored_dots[channel_id]
+                    self._shown.pop(key, None)
+                    self._retry_at.pop(key, None)
+                channel = self.bot.get_channel(int(card["channel_id"])) if card else None
+                if channel is not None:
+                    try:
+                        await channel.get_partial_message(int(card["message_id"])).delete()
+                    except discord.NotFound:
+                        pass
+                    except discord.HTTPException:
+                        failed.append(channel.mention)
+        msg = f"Removed {len(found)}."
+        if failed:
+            msg += " Couldn't delete the card message in " + ", ".join(failed) + "; delete those by hand."
+        await ctx.send(msg, allowed_mentions=NO_MENTIONS)
+
     @containercard.command(name="autosetup")
     async def cc_autosetup(self, ctx: commands.Context, category: Optional[discord.CategoryChannel] = None) -> None:
         """Find channels named after containers and set them up after you confirm.
@@ -754,10 +900,17 @@ class ContainerStatus(commands.Cog):
         channels = category.text_channels if category else ctx.guild.text_channels
         plan: List[Tuple[discord.TextChannel, str, Optional[str], str]] = []
         unsure: List[str] = []
+        left_alone: List[str] = []
         for channel in channels:
             if channel.id in taken:
                 continue
             matches = self._match(channel.name, containers)
+            if not matches:
+                continue
+            reason = await self._pz_reason(channel)
+            if reason:
+                left_alone.append(f"#{channel.name}: {reason}")
+                continue
             if len(matches) == 1:
                 name, env, env_name = matches[0]
                 plan.append((channel, name, env, env_name))
@@ -767,6 +920,8 @@ class ContainerStatus(commands.Cog):
             msg = "No new channels match a container."
             if unsure:
                 msg += " These match more than one, so use `!containercard setup #channel <container>`:\n" + "\n".join(unsure)
+            if left_alone:
+                msg += "\nLeft alone:\n" + "\n".join(left_alone)
             await ctx.send(_truncate(msg, 1900), allowed_mentions=NO_MENTIONS)
             return
         lines = [
@@ -775,6 +930,8 @@ class ContainerStatus(commands.Cog):
         text = "I'll post a card and add a status dot in each of these:\n" + "\n".join(lines)
         if unsure:
             text += "\n\nSkipping these, which match more than one container:\n" + "\n".join(unsure)
+        if left_alone:
+            text += "\n\nLeaving these alone:\n" + "\n".join(left_alone)
         for page in pagify(text, page_length=1800):
             await ctx.send(box(page))
         await ctx.send(f"Type `yes` within {CONFIRM_TIMEOUT} seconds to set up {len(plan)} channel(s).")
