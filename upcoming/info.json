@@ -1,0 +1,12 @@
+{
+    "author": ["Jay"],
+    "name": "Upcoming",
+    "short": "Live messages for movies coming out digitally soon and the week ahead in Radarr, Sonarr and Seerr.",
+    "description": "Keeps two messages in one channel up to date. \"Out digitally soon\" lists movies in Radarr whose digital release is in the next 30 days (7 to 90, your choice), marking ones already in the library. \"Coming up this week\" is a day-by-day calendar of Radarr's digital and physical releases and, if you add Sonarr, new episodes, followed by Seerr requests waiting for approval and approved ones not in the library yet. It only knows about movies Radarr is monitoring, not every film coming out. The bot only reads from these services; it can't approve requests or change anything. The messages are checked every 30 minutes, and only while the bot is running.",
+    "install_msg": "DM the bot to add each service's URL and API key (Settings > General in Radarr and Sonarr, Settings > General > API Key in Seerr): [p]set api radarr url <radarr url> api_key <key>, [p]set api seerr url <seerr url> api_key <key>, and optionally [p]set api sonarr url <sonarr url> api_key <key> for TV episodes. Check them with [p]upcoming show, set your timezone with [p]upcoming timezone Europe/London, then post the messages with [p]upcoming setup #channel.",
+    "requirements": ["tzdata"],
+    "tags": ["radarr", "sonarr", "seerr", "overseerr", "jellyseerr", "calendar", "homelab"],
+    "min_bot_version": "3.5.0",
+    "min_python_version": [3, 9, 0],
+    "end_user_data_statement": "This cog stores no data about users."
+}
