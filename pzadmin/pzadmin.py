@@ -32,6 +32,7 @@ NO_MENTIONS = discord.AllowedMentions.none()
 # channel's name" option, so either can tidy up after the other.
 DOT_ONLINE = "\N{LARGE GREEN CIRCLE}"
 DOT_OFFLINE = "\N{LARGE RED CIRCLE}"
+DOT_RESTARTING = "\N{LARGE ORANGE CIRCLE}"
 DOT_PREFIX = re.compile(
     "^(?:\N{LARGE GREEN CIRCLE}|\N{LARGE RED CIRCLE}|\N{LARGE YELLOW CIRCLE}|\N{MEDIUM BLACK CIRCLE}"
     "|\N{MEDIUM WHITE CIRCLE}|\N{LARGE ORANGE CIRCLE})[\\s\\-_|\N{BOX DRAWINGS HEAVY VERTICAL}"
@@ -107,14 +108,17 @@ def _with_dot(dot: str, channel: Any) -> str:
 def _wanted_dot(server: Dict[str, Any]) -> Optional[str]:
     """The dot a server's state calls for, or None to leave the name as it is.
 
-    A restart, deploy or a state PZAdmin hasn't checked yet keeps the last dot,
-    so a planned restart doesn't spend both renames on red and back.
+    PZAdmin reports "restarting" from the moment it saves and quits (after the
+    in-game countdown) until the server answers again, and "deploying" while it
+    installs one. A state PZAdmin hasn't checked yet keeps the last dot.
     """
     state = server.get("state")
     if state == "online":
         return DOT_ONLINE
     if state in ("offline", "stopped"):
         return DOT_OFFLINE
+    if state in ("restarting", "deploying"):
+        return DOT_RESTARTING
     return None
 
 
@@ -682,9 +686,11 @@ class PZAdmin(commands.Cog):
                 ds.want, ds.want_since = dot, now
             if ds.want == ds.shown:
                 continue
-            # The first dot goes up straight away; after that a state has to
-            # last before it is worth one of the two renames.
-            if ds.shown is not None and now - ds.want_since < DOT_SETTLE:
+            # The first dot goes up straight away, and so do a restart and the
+            # recovery from one, which PZAdmin does on purpose. Anything else
+            # has to last before it is worth one of the two renames.
+            deliberate = DOT_RESTARTING in (ds.want, ds.shown)
+            if ds.shown is not None and not deliberate and now - ds.want_since < DOT_SETTLE:
                 continue
             if not ds.budget(now):
                 continue
@@ -783,7 +789,9 @@ class PZAdmin(commands.Cog):
     @pzadminset.group(name="dots")
     @commands.guild_only()
     async def pzadminset_dots(self, ctx: commands.Context) -> None:
-        """Show a server's status as \N{LARGE GREEN CIRCLE} / \N{LARGE RED CIRCLE} at the start of a channel's name.
+        """Show a server's status as \N{LARGE GREEN CIRCLE} / \N{LARGE ORANGE CIRCLE} / \N{LARGE RED CIRCLE} at the start of a channel's name.
+
+        \N{LARGE ORANGE CIRCLE} means a restart is in progress.
 
         Don't use this on a channel where PZAdmin's own "Show \N{LARGE GREEN CIRCLE} / \N{LARGE RED CIRCLE} in the
         channel's name" option is on: both bots would rename it and use up Discord's limit of two renames every
