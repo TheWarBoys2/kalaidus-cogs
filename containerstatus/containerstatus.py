@@ -2,9 +2,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import quote, urlencode, urlparse
 
 import aiohttp
@@ -38,6 +39,18 @@ COLOUR_BUSY = 0xD38B3A
 COLOUR_DOWN = 0xC4553F
 COLOUR_UNKNOWN = 0x8A8272
 FOOTER = "Updated via Arcane"
+
+# Status dots in channel names, working the same way as the pzadmin cog's.
+DOT_PREFIX = re.compile(
+    "^(?:\N{LARGE GREEN CIRCLE}|\N{LARGE RED CIRCLE}|\N{LARGE YELLOW CIRCLE}|\N{MEDIUM BLACK CIRCLE}"
+    "|\N{MEDIUM WHITE CIRCLE}|\N{LARGE ORANGE CIRCLE})[\\s\\-_|\N{BOX DRAWINGS HEAVY VERTICAL}"
+    "\N{KATAKANA MIDDLE DOT}\N{BULLET}]*"
+)
+DOT_SETTLE = 90  # a new state has to hold this long before the name follows
+RENAME_WINDOW = 600  # Discord allows two renames per channel every ten minutes
+RENAMES_PER_WINDOW = 2
+RENAME_TIMEOUT = 15  # discord.py sleeps through a rate limit; don't let it stall the loop
+DotChannel = Union[discord.TextChannel, discord.VoiceChannel, discord.ForumChannel, discord.StageChannel]
 
 
 class ArcaneError(Exception):
@@ -88,6 +101,45 @@ def _clean_url(url: str) -> Optional[str]:
     if parsed.scheme not in ("http", "https") or not parsed.netloc or " " in url:
         return None
     return url
+
+
+def wanted_dot(status: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The dot a container's status calls for, or None to leave the name alone."""
+    if status is None:
+        return None  # Arcane can't be read: that isn't the same as down
+    if status.get("missing"):
+        return DOT_DOWN
+    state, health = status.get("state") or "", status.get("health") or ""
+    if status.get("running") and state != "paused":
+        return DOT_BUSY if health in ("starting", "unhealthy") else DOT_UP
+    if state in ("restarting", "paused"):
+        return DOT_BUSY
+    return DOT_DOWN
+
+
+def _base_name(name: str) -> str:
+    return DOT_PREFIX.sub("", name)
+
+
+def _with_dot(dot: str, channel: Any) -> str:
+    # Text and forum channels can't hold spaces, so they get a hyphen.
+    sep = "-" if isinstance(channel, (discord.TextChannel, discord.ForumChannel)) else " "
+    return dot + sep + _base_name(channel.name)
+
+
+class _DotState:
+    """What the cog knows about one channel it puts a dot in. Kept in memory."""
+
+    def __init__(self, shown: Optional[str]) -> None:
+        self.shown = shown
+        self.want: Optional[str] = None
+        self.want_since = 0.0
+        self.renames: List[float] = []
+        self.retry_at = 0.0
+
+    def budget(self, now: float) -> bool:
+        self.renames = [t for t in self.renames if now - t < RENAME_WINDOW]
+        return len(self.renames) < RENAMES_PER_WINDOW
 
 
 def render(card: Dict[str, Any], status: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -157,13 +209,15 @@ class ContainerStatus(commands.Cog):
         # cards: card ID -> {channel_id, message_id, container, title,
         # description, link, link_label, environment}. A card without an
         # environment reads the default one.
-        self.config.register_global(environment=DEFAULT_ENVIRONMENT, cards={}, next_id=1)
+        # dots: channel ID -> card ID whose status goes at the start of its name
+        self.config.register_global(environment=DEFAULT_ENVIRONMENT, cards={}, next_id=1, dots={})
         self._session: Optional[aiohttp.ClientSession] = None
         self._task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
         self._shown: Dict[str, str] = {}  # card ID -> hash of what the message says
         self._retry_at: Dict[str, float] = {}
         self._failures: Dict[str, int] = {}  # environment ID -> failed checks in a row
+        self._dots: Dict[int, _DotState] = {}
 
     async def cog_load(self) -> None:
         self._session = aiohttp.ClientSession()
@@ -321,6 +375,7 @@ class ContainerStatus(commands.Cog):
                 by_env.setdefault(card.get("environment") or default, {})[card_id] = card
             # Each environment is checked on its own, so one that's offline
             # (an agent on another machine, say) doesn't grey out the rest.
+            wanted: Dict[str, Optional[str]] = {}  # card ID -> dot, for cards checked this time
             for env, env_cards in by_env.items():
                 try:
                     statuses: Optional[Dict[str, Dict[str, Any]]] = await self._statuses(
@@ -335,7 +390,57 @@ class ContainerStatus(commands.Cog):
                     statuses = None
                 for card_id, card in env_cards.items():
                     status = None if statuses is None else statuses.get(card["container"])
+                    wanted[card_id] = wanted_dot(status)
                     await self._show(card_id, card, render(card, status))
+            await self._sync_dots(wanted)
+
+    async def _sync_dots(self, wanted: Dict[str, Optional[str]]) -> None:
+        dots = {int(k): str(v) for k, v in (await self.config.dots()).items()}
+        for channel_id in list(self._dots):
+            if channel_id not in dots:
+                del self._dots[channel_id]
+        now = time.monotonic()
+        for channel_id, card_id in dots.items():
+            dot = wanted.get(card_id)
+            if dot is None:
+                continue  # not checked this time, or status unknown: keep the last dot
+            channel = self.bot.get_channel(channel_id)
+            if channel is None:
+                continue
+            ds = self._dots.get(channel_id)
+            if ds is None:
+                match = DOT_PREFIX.match(channel.name)
+                ds = self._dots[channel_id] = _DotState(match.group(0)[:1] if match else None)
+            if now < ds.retry_at:
+                continue
+            if dot != ds.want:
+                ds.want, ds.want_since = dot, now
+            if ds.want == ds.shown:
+                continue
+            # The first dot goes up straight away, and so do a restart and the
+            # recovery from one. Anything else has to last before it is worth
+            # one of the two renames.
+            deliberate = DOT_BUSY in (ds.want, ds.shown)
+            if ds.shown is not None and not deliberate and now - ds.want_since < DOT_SETTLE:
+                continue
+            if not ds.budget(now):
+                continue
+            try:
+                await self._rename(channel, _with_dot(ds.want, channel))
+            except (discord.HTTPException, asyncio.TimeoutError) as e:
+                ds.retry_at = now + RENAME_WINDOW
+                log.warning("Status dots: couldn't rename channel %s: %s", channel_id, e)
+            else:
+                ds.shown = ds.want
+                ds.renames.append(now)
+
+    @staticmethod
+    async def _rename(channel: Any, name: str) -> None:
+        if name == channel.name:
+            return
+        await asyncio.wait_for(
+            channel.edit(name=name[:100], reason="Container status"), timeout=RENAME_TIMEOUT
+        )
 
     async def _show(self, card_id: str, card: Dict[str, Any], embed: Dict[str, Any]) -> None:
         digest = _hash(embed)
@@ -562,6 +667,9 @@ class ContainerStatus(commands.Cog):
         async with self._lock:
             async with self.config.cards() as cards:
                 card = cards.pop(card_id, None)
+            async with self.config.dots() as dots:
+                for channel_id in [c for c, cid in dots.items() if str(cid) == card_id]:
+                    del dots[channel_id]
             self._shown.pop(card_id, None)
             self._retry_at.pop(card_id, None)
         if card is None:
@@ -679,6 +787,97 @@ class ContainerStatus(commands.Cog):
         await self.config.environment.set(environment)
         self._shown.clear()
         await ctx.tick()
+
+    @containercard.group(name="dots")
+    async def cc_dots(self, ctx: commands.Context) -> None:
+        """Show a card's status as \N{LARGE GREEN CIRCLE} / \N{LARGE ORANGE CIRCLE} / \N{LARGE RED CIRCLE} at the start of a channel's name.
+
+        \N{LARGE ORANGE CIRCLE} means starting, restarting, paused or unhealthy.
+        """
+
+    @cc_dots.command(name="add")
+    async def cc_dots_add(self, ctx: commands.Context, channel: DotChannel, card_id: Optional[str] = None) -> None:
+        """Put a card's status dot in a channel's name.
+
+        The card defaults to the one posted in that channel, if there's only one.
+        Example: `!containercard dots add #jellyfin 1`
+        """
+        cards = await self.config.cards()
+        if card_id is None:
+            here = [cid for cid, c in cards.items() if int(c["channel_id"]) == channel.id]
+            if len(here) != 1:
+                await ctx.send(
+                    f"Say which card: `!containercard dots add #{channel.name} <card>`. "
+                    "`!containercard list` shows the numbers.",
+                    allowed_mentions=NO_MENTIONS,
+                )
+                return
+            card_id = here[0]
+        card = cards.get(card_id)
+        if card is None:
+            await ctx.send(f"There's no card {card_id}. `!containercard list` shows them.")
+            return
+        async with self.config.dots() as dots:
+            dots[str(channel.id)] = card_id
+        self._dots.pop(channel.id, None)
+        title = discord.utils.escape_markdown(card.get("title") or card["container"])
+        lines = [
+            f"{channel.mention} will show **{title}**'s status in its name. It follows within a couple of "
+            "minutes; Discord only allows two renames every ten minutes, so a container that flaps may take longer."
+        ]
+        pz = self.bot.get_cog("PZAdmin")
+        if pz is not None:
+            try:
+                pz_dots = await pz.config.guild(channel.guild).status_channels()
+            except Exception:
+                pz_dots = {}
+            if str(channel.id) in pz_dots:
+                lines.append(
+                    "\N{WARNING SIGN} The pzadmin cog already puts a dot in this channel's name. Turn one off "
+                    "(`!pzadminset dots remove` or `!containercard dots remove`): both renaming it will fight over "
+                    "Discord's limit."
+                )
+        if not channel.permissions_for(channel.guild.me).manage_channels:
+            lines.append("\N{WARNING SIGN} I don't have **Manage Channels** on that channel yet, so I can't rename it.")
+        await ctx.send("\n\n".join(lines), allowed_mentions=NO_MENTIONS)
+        await self._refresh(card_id)
+
+    @cc_dots.command(name="remove")
+    async def cc_dots_remove(self, ctx: commands.Context, channel: DotChannel) -> None:
+        """Stop showing a status dot and put the channel's plain name back."""
+        async with self.config.dots() as dots:
+            removed = dots.pop(str(channel.id), None)
+        self._dots.pop(channel.id, None)
+        if removed is None:
+            await ctx.send(f"{channel.mention} doesn't have a status dot from me.", allowed_mentions=NO_MENTIONS)
+            return
+        try:
+            await self._rename(channel, _base_name(channel.name))
+        except (discord.HTTPException, asyncio.TimeoutError):
+            await ctx.send(
+                f"{channel.mention} won't get status dots any more, but Discord wouldn't let me rename it just now. "
+                "Remove the dot by hand or try again in ten minutes.",
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        await ctx.send(f"{channel.mention} won't get status dots any more.", allowed_mentions=NO_MENTIONS)
+
+    @cc_dots.command(name="list")
+    async def cc_dots_list(self, ctx: commands.Context) -> None:
+        """List which channels show which card's status."""
+        dots = await self.config.dots()
+        if not dots:
+            await ctx.send("No channels show a status dot. Use `!containercard dots add #channel [card]`.")
+            return
+        cards = await self.config.cards()
+        lines = []
+        for channel_id, card_id in dots.items():
+            channel = self.bot.get_channel(int(channel_id))
+            where = channel.mention if channel else f"deleted channel {channel_id}"
+            card = cards.get(str(card_id))
+            what = (card.get("title") or card["container"]) if card else "a removed card"
+            lines.append(f"{where} \N{RIGHTWARDS ARROW} card {card_id}, {discord.utils.escape_markdown(what)}")
+        await ctx.send(_truncate("\n".join(lines), 1900), allowed_mentions=NO_MENTIONS)
 
     @containercard.command(name="refresh")
     async def cc_refresh(self, ctx: commands.Context) -> None:
