@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -26,6 +27,21 @@ MAX_NOTE = 300  # PZAdmin's limit on a mod request note
 MAX_REQUESTED_BY = 100
 WORKSHOP_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id={}"
 NO_MENTIONS = discord.AllowedMentions.none()
+
+# Status dots in channel names. These match PZAdmin's own "Show 🟢 / 🔴 in the
+# channel's name" option, so either can tidy up after the other.
+DOT_ONLINE = "\N{LARGE GREEN CIRCLE}"
+DOT_OFFLINE = "\N{LARGE RED CIRCLE}"
+DOT_PREFIX = re.compile(
+    "^(?:\N{LARGE GREEN CIRCLE}|\N{LARGE RED CIRCLE}|\N{LARGE YELLOW CIRCLE}|\N{MEDIUM BLACK CIRCLE}"
+    "|\N{MEDIUM WHITE CIRCLE}|\N{LARGE ORANGE CIRCLE})[\\s\\-_|\N{BOX DRAWINGS HEAVY VERTICAL}"
+    "\N{KATAKANA MIDDLE DOT}\N{BULLET}]*"
+)
+DOT_EVERY = 30  # seconds between status checks
+DOT_SETTLE = 90  # a new state has to hold this long before the name follows
+RENAME_WINDOW = 600  # Discord allows two renames per channel every ten minutes
+RENAMES_PER_WINDOW = 2
+RENAME_TIMEOUT = 15  # discord.py sleeps through a rate limit; don't let it stall the loop
 
 STATE_ICONS = {
     "online": "\N{LARGE GREEN CIRCLE}",
@@ -78,6 +94,45 @@ def _parse_time(value: Optional[str]) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _base_name(name: str) -> str:
+    return DOT_PREFIX.sub("", name)
+
+
+def _with_dot(dot: str, channel: Any) -> str:
+    # Text and forum channels can't hold spaces, so they get a hyphen like PZAdmin uses.
+    sep = "-" if isinstance(channel, (discord.TextChannel, discord.ForumChannel)) else " "
+    return dot + sep + _base_name(channel.name)
+
+
+def _wanted_dot(server: Dict[str, Any]) -> Optional[str]:
+    """The dot a server's state calls for, or None to leave the name as it is.
+
+    A restart, deploy or a state PZAdmin hasn't checked yet keeps the last dot,
+    so a planned restart doesn't spend both renames on red and back.
+    """
+    state = server.get("state")
+    if state == "online":
+        return DOT_ONLINE
+    if state in ("offline", "stopped"):
+        return DOT_OFFLINE
+    return None
+
+
+class _DotState:
+    """What the cog knows about one channel it puts a dot in. Kept in memory."""
+
+    def __init__(self, shown: Optional[str]) -> None:
+        self.shown = shown
+        self.want: Optional[str] = None
+        self.want_since = 0.0
+        self.renames: List[float] = []
+        self.retry_at = 0.0
+
+    def budget(self, now: float) -> bool:
+        self.renames = [t for t in self.renames if now - t < RENAME_WINDOW]
+        return len(self.renames) < RENAMES_PER_WINDOW
+
+
 def _timestamp(value: Optional[str]) -> str:
     dt = _parse_time(value)
     return discord.utils.format_dt(dt, "R") if dt else "never"
@@ -127,16 +182,23 @@ class PZAdmin(commands.Cog):
         self.config.register_global(base_url=None)
         # channel ID -> {"id": PZAdmin server ID, "name": its name when linked}
         self.config.register_guild(channels={})
+        # channel ID -> {"id": PZAdmin server ID, "name": its name} for status dots
+        self.config.register_guild(status_channels={})
         self._session: Optional[aiohttp.ClientSession] = None
         self._cache: List[Dict[str, Any]] = []
         self._cache_time = 0.0
         self._cache_lock = asyncio.Lock()
         self._restart_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._dots: Dict[int, _DotState] = {}
+        self._dot_task: Optional[asyncio.Task] = None
 
     async def cog_load(self) -> None:
         self._session = aiohttp.ClientSession()
+        self._dot_task = asyncio.create_task(self._dot_loop())
 
     async def cog_unload(self) -> None:
+        if self._dot_task:
+            self._dot_task.cancel()
         if self._session:
             await self._session.close()
 
@@ -567,6 +629,82 @@ class PZAdmin(commands.Cog):
     ) -> List[app_commands.Choice[str]]:
         return await self._server_autocomplete(interaction, current)
 
+    # ---------- status dots in channel names ----------
+
+    async def _dot_loop(self) -> None:
+        await self.bot.wait_until_red_ready()
+        while True:
+            try:
+                await self._sync_dots()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Status dots: sync failed")
+            await asyncio.sleep(DOT_EVERY)
+
+    async def _sync_dots(self) -> None:
+        all_guilds = await self.config.all_guilds()
+        wanted = {
+            int(channel_id): link
+            for data in all_guilds.values()
+            for channel_id, link in (data.get("status_channels") or {}).items()
+        }
+        for channel_id in list(self._dots):
+            if channel_id not in wanted:
+                del self._dots[channel_id]
+        if not wanted:
+            return
+
+        try:
+            async with self._cache_lock:
+                servers = await self._fetch_servers()
+        except PZAdminError as e:
+            log.debug("Status dots: can't read servers: %s", e)
+            return  # an unreachable PZAdmin isn't the same as an offline server
+        by_id = {str(s.get("id")): s for s in servers}
+
+        now = time.monotonic()
+        for channel_id, link in wanted.items():
+            channel = self.bot.get_channel(channel_id)
+            server = by_id.get(str(link.get("id")))
+            if channel is None or server is None:
+                continue  # deleted channel, or a server this key can't see
+            ds = self._dots.get(channel_id)
+            if ds is None:
+                match = DOT_PREFIX.match(channel.name)
+                ds = self._dots[channel_id] = _DotState(match.group(0)[:1] if match else None)
+            if now < ds.retry_at:
+                continue
+            dot = _wanted_dot(server)
+            if dot is None:
+                continue
+            if dot != ds.want:
+                ds.want, ds.want_since = dot, now
+            if ds.want == ds.shown:
+                continue
+            # The first dot goes up straight away; after that a state has to
+            # last before it is worth one of the two renames.
+            if ds.shown is not None and now - ds.want_since < DOT_SETTLE:
+                continue
+            if not ds.budget(now):
+                continue
+            try:
+                await self._rename(channel, _with_dot(ds.want, channel))
+            except (discord.HTTPException, asyncio.TimeoutError) as e:
+                ds.retry_at = now + RENAME_WINDOW
+                log.warning("Status dots: couldn't rename channel %s: %s", channel_id, e)
+            else:
+                ds.shown = ds.want
+                ds.renames.append(now)
+
+    @staticmethod
+    async def _rename(channel: Any, name: str) -> None:
+        if name == channel.name:
+            return
+        await asyncio.wait_for(
+            channel.edit(name=name[:100], reason="PZAdmin server status"), timeout=RENAME_TIMEOUT
+        )
+
     # ---------- owner settings ----------
 
     @commands.group(name="pzadminset")
@@ -637,6 +775,96 @@ class PZAdmin(commands.Cog):
             return
         lines = []
         for channel_id, link in links.items():
+            channel = ctx.guild.get_channel(int(channel_id))
+            where = channel.mention if channel else f"deleted channel {channel_id}"
+            lines.append(f"{where} \N{RIGHTWARDS ARROW} {discord.utils.escape_markdown(str(link.get('name') or link['id']))}")
+        await ctx.send(_truncate("\n".join(lines), 1900), allowed_mentions=NO_MENTIONS)
+
+    @pzadminset.group(name="dots")
+    @commands.guild_only()
+    async def pzadminset_dots(self, ctx: commands.Context) -> None:
+        """Show a server's status as \N{LARGE GREEN CIRCLE} / \N{LARGE RED CIRCLE} at the start of a channel's name.
+
+        Don't use this on a channel where PZAdmin's own "Show \N{LARGE GREEN CIRCLE} / \N{LARGE RED CIRCLE} in the
+        channel's name" option is on: both bots would rename it and use up Discord's limit of two renames every
+        ten minutes.
+        """
+
+    @pzadminset_dots.command(name="add")
+    async def pzadminset_dots_add(
+        self,
+        ctx: commands.Context,
+        channel: Union[discord.TextChannel, discord.VoiceChannel, discord.ForumChannel, discord.StageChannel],
+        *,
+        server: Optional[str] = None,
+    ) -> None:
+        """Put a status dot in a channel's name. The server defaults to the one the channel is linked to."""
+        if server is None:
+            link = (await self.config.guild(ctx.guild).channels()).get(str(channel.id))
+            if not link:
+                await ctx.send(
+                    f"{channel.mention} isn't linked to a server. Name one: "
+                    f"`pzadminset dots add #channel <server>`.",
+                    allowed_mentions=NO_MENTIONS,
+                )
+                return
+            server = link["id"]
+        async with ctx.typing():
+            try:
+                s = await self._resolve(server)
+            except PZAdminError as e:
+                await ctx.send(str(e), allowed_mentions=NO_MENTIONS)
+                return
+        name = str(s.get("name") or s["id"])
+        async with self.config.guild(ctx.guild).status_channels() as dots:
+            dots[str(channel.id)] = {"id": str(s["id"]), "name": name}
+        self._dots.pop(channel.id, None)
+
+        lines = [
+            f"{channel.mention} will show **{discord.utils.escape_markdown(name)}**'s status in its name. "
+            f"It follows within a couple of minutes; Discord only allows two renames every ten minutes, "
+            f"so a server that flaps may take longer.",
+            "\N{WARNING SIGN} If PZAdmin's own \"Show \N{LARGE GREEN CIRCLE} / \N{LARGE RED CIRCLE} in the channel's "
+            "name\" option is on for this channel (Discord page in PZAdmin), turn one of them off. Both bots "
+            "renaming the same channel will fight over that limit.",
+        ]
+        if not channel.permissions_for(ctx.guild.me).manage_channels:
+            lines.append("\N{WARNING SIGN} I don't have **Manage Channels** on that channel yet, so I can't rename it.")
+        await ctx.send("\n\n".join(lines), allowed_mentions=NO_MENTIONS)
+
+    @pzadminset_dots.command(name="remove")
+    async def pzadminset_dots_remove(
+        self,
+        ctx: commands.Context,
+        channel: Union[discord.TextChannel, discord.VoiceChannel, discord.ForumChannel, discord.StageChannel],
+    ) -> None:
+        """Stop showing a status dot and put the channel's plain name back."""
+        async with self.config.guild(ctx.guild).status_channels() as dots:
+            removed = dots.pop(str(channel.id), None)
+        self._dots.pop(channel.id, None)
+        if not removed:
+            await ctx.send(f"{channel.mention} doesn't have a status dot from me.", allowed_mentions=NO_MENTIONS)
+            return
+        try:
+            await self._rename(channel, _base_name(channel.name))
+        except (discord.HTTPException, asyncio.TimeoutError):
+            await ctx.send(
+                f"{channel.mention} won't get status dots any more, but Discord wouldn't let me rename it just now. "
+                f"Remove the dot by hand or try again in ten minutes.",
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+        await ctx.send(f"{channel.mention} won't get status dots any more.", allowed_mentions=NO_MENTIONS)
+
+    @pzadminset_dots.command(name="list")
+    async def pzadminset_dots_list(self, ctx: commands.Context) -> None:
+        """List which channels show which server's status."""
+        dots = await self.config.guild(ctx.guild).status_channels()
+        if not dots:
+            await ctx.send("No channels show a status dot. Use `pzadminset dots add #channel [server]`.")
+            return
+        lines = []
+        for channel_id, link in dots.items():
             channel = ctx.guild.get_channel(int(channel_id))
             where = channel.mention if channel else f"deleted channel {channel_id}"
             lines.append(f"{where} \N{RIGHTWARDS ARROW} {discord.utils.escape_markdown(str(link.get('name') or link['id']))}")
