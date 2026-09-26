@@ -28,6 +28,10 @@ MAX_TITLE = 256
 MAX_DESCRIPTION = 1000
 MAX_LABEL = 80
 NO_MENTIONS = discord.AllowedMentions.none()
+CONFIRM_TIMEOUT = 60
+# The container a stack is named after, when a channel matches several:
+# #immich picks immich_server over immich_machine_learning.
+MAIN_SUFFIXES = ("server", "app", "web", "main", "core", "frontend")
 
 # The same dots and embed colours as PZAdmin's live status cards.
 DOT_UP = "\N{LARGE GREEN CIRCLE}"
@@ -57,6 +61,10 @@ DotChannel = Union[discord.TextChannel, discord.VoiceChannel, discord.ForumChann
 
 class ArcaneError(Exception):
     """An error with a message that is safe to show in Discord."""
+
+
+class SetupError(Exception):
+    """A card couldn't be set up; the message is safe to show in Discord."""
 
 
 class UnknownEnvironment(ArcaneError):
@@ -132,6 +140,10 @@ def _update_line(info: Dict[str, Any]) -> str:
     if current and latest and current != latest:
         return f"Update available: `{_truncate(current, 40)}` \N{RIGHTWARDS ARROW} `{_truncate(latest, 40)}`"
     return "Update available: a newer image for this tag"
+
+
+def _norm(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
 
 
 def _base_name(name: str) -> str:
@@ -580,11 +592,24 @@ class ContainerStatus(commands.Cog):
             except ArcaneError as e:
                 await ctx.send(str(e))
                 return
-        me = channel.guild.me
-        perms = channel.permissions_for(me)
-        if not (perms.send_messages and perms.embed_links and perms.view_channel):
-            await ctx.send(f"I need View Channel, Send Messages and Embed Links in {channel.mention}.")
+        try:
+            card_id = await self._post_card(channel, container, env, title)
+        except SetupError as e:
+            await ctx.send(str(e))
             return
+        await ctx.send(
+            f"Card {card_id} is up in {channel.mention}. Add a link with "
+            f"`!containercard link {card_id} <url> [label]` and a description with "
+            f"`!containercard description {card_id} <text>`."
+        )
+
+    async def _post_card(
+        self, channel: discord.TextChannel, container: str, env: Optional[str], title: Optional[str] = None
+    ) -> str:
+        """Post and store a new card, returning its ID. Raises SetupError."""
+        perms = channel.permissions_for(channel.guild.me)
+        if not (perms.send_messages and perms.embed_links and perms.view_channel):
+            raise SetupError(f"I need View Channel, Send Messages and Embed Links in {channel.mention}.")
         card = {
             "channel_id": channel.id,
             "container": container,
@@ -598,18 +623,185 @@ class ContainerStatus(commands.Cog):
         try:
             message = await channel.send(embed=placeholder, allowed_mentions=NO_MENTIONS)
         except discord.HTTPException as e:
-            await ctx.send(f"Couldn't post in {channel.mention}: {e}")
-            return
+            raise SetupError(f"Couldn't post in {channel.mention}: {e}") from None
         card["message_id"] = message.id
         async with self.config.all() as data:
             card_id = str(data.get("next_id", 1))
             data["next_id"] = int(card_id) + 1
             data.setdefault("cards", {})[card_id] = card
         await self._refresh(card_id)
+        return card_id
+
+    async def _pz_dot_channels(self, guild: discord.Guild) -> set:
+        """Channels the pzadmin cog puts a dot in, so both cogs don't rename one channel."""
+        pz = self.bot.get_cog("PZAdmin")
+        if pz is None:
+            return set()
+        try:
+            return set((await pz.config.guild(guild).status_channels()).keys())
+        except Exception:
+            return set()
+
+    # ---------- matching channels to containers ----------
+
+    async def _all_containers(self) -> List[Tuple[str, Optional[str], str]]:
+        """(container, environment to store, environment name) for every container Arcane can see."""
+        default = await self.config.environment()
+        try:
+            envs = await self._environments()
+        except ArcaneError:
+            envs = []
+        if not any(e["id"] == default for e in envs):
+            envs.insert(0, {"id": default, "name": default, "status": ""})
+        found = []
+        for env in envs:
+            try:
+                summaries = await self._list(env["id"])
+            except ArcaneError:
+                if env["id"] == default:
+                    raise
+                continue  # an offline environment just has nothing to match
+            for summary in summaries:
+                names = self._names(summary)
+                if names:
+                    found.append((names[0], None if env["id"] == default else env["id"], env["name"]))
+        return found
+
+    @staticmethod
+    def _match(channel_name: str, containers: List[Tuple[str, Optional[str], str]]) -> List[Tuple[str, Optional[str], str]]:
+        """The containers a channel's name points at: an exact match, else the main one of a stack.
+
+        Names are compared without dots, emoji, case, dashes or underscores,
+        so #🟢-home-assistant matches home_assistant or homeassistant. A
+        channel called #immich matches immich_server when no container is
+        called just immich.
+        """
+        want = _norm(_base_name(channel_name))
+        if not want:
+            return []
+        exact = [c for c in containers if _norm(c[0]) == want]
+        if exact:
+            return exact
+        prefixed = [c for c in containers if _norm(c[0]).startswith(want)]
+        if len(prefixed) <= 1:
+            return prefixed
+        main = [c for c in prefixed if _norm(c[0])[len(want):] in MAIN_SUFFIXES]
+        return main if len(main) == 1 else prefixed
+
+    async def _setup_one(self, channel: discord.TextChannel, container: str, env: Optional[str]) -> str:
+        """Card and dot for one channel; returns what happened, in words."""
+        card_id = await self._post_card(channel, container, env)
+        parts = [f"card {card_id}"]
+        if str(channel.id) in await self._pz_dot_channels(channel.guild):
+            parts.append("no dot (the pzadmin cog already puts one here)")
+        elif not channel.permissions_for(channel.guild.me).manage_channels:
+            parts.append("no dot (I need Manage Channels there)")
+        else:
+            async with self.config.dots() as dots:
+                dots[str(channel.id)] = card_id
+            self._dots.pop(channel.id, None)
+            await self._refresh(card_id)
+            parts.append("dot")
+        return " + ".join(parts)
+
+    @containercard.command(name="setup")
+    async def cc_setup(self, ctx: commands.Context, channel: discord.TextChannel, container: Optional[str] = None) -> None:
+        """Card and status dot for a channel in one go.
+
+        The container defaults to the one the channel is named after.
+        Examples: `!containercard setup #jellyfin`, `!containercard setup #photos immich_server`
+        """
+        async with ctx.typing():
+            try:
+                if container:
+                    name, env = await self._locate(container)
+                else:
+                    matches = self._match(channel.name, await self._all_containers())
+                    if len(matches) != 1:
+                        options = ", ".join(f"`{c[0]}`" for c in matches[:10])
+                        await ctx.send(
+                            (f"#{channel.name} could be {options}. " if matches
+                             else f"No container matches #{channel.name}. ")
+                            + f"Name it: `!containercard setup #{channel.name} <container>`.",
+                            allowed_mentions=NO_MENTIONS,
+                        )
+                        return
+                    name, env = matches[0][0], matches[0][1]
+                result = await self._setup_one(channel, name, env)
+            except (ArcaneError, SetupError) as e:
+                await ctx.send(str(e), allowed_mentions=NO_MENTIONS)
+                return
+        await ctx.send(f"{channel.mention} \N{RIGHTWARDS ARROW} `{name}`: {result}.", allowed_mentions=NO_MENTIONS)
+
+    @containercard.command(name="autosetup")
+    async def cc_autosetup(self, ctx: commands.Context, category: Optional[discord.CategoryChannel] = None) -> None:
+        """Find channels named after containers and set them up after you confirm.
+
+        Looks at this server's text channels (or one category's), skips any that
+        already have a card, and shows what it would do before doing anything.
+        """
+        if ctx.guild is None:
+            await ctx.send("Run this in the server whose channels you want set up.")
+            return
+        async with ctx.typing():
+            try:
+                containers = await self._all_containers()
+            except ArcaneError as e:
+                await ctx.send(str(e))
+                return
+        cards = await self.config.cards()
+        taken = {int(c["channel_id"]) for c in cards.values()}
+        channels = category.text_channels if category else ctx.guild.text_channels
+        plan: List[Tuple[discord.TextChannel, str, Optional[str], str]] = []
+        unsure: List[str] = []
+        for channel in channels:
+            if channel.id in taken:
+                continue
+            matches = self._match(channel.name, containers)
+            if len(matches) == 1:
+                name, env, env_name = matches[0]
+                plan.append((channel, name, env, env_name))
+            elif matches:
+                unsure.append(f"#{channel.name}: " + ", ".join(c[0] for c in matches[:5]))
+        if not plan:
+            msg = "No new channels match a container."
+            if unsure:
+                msg += " These match more than one, so use `!containercard setup #channel <container>`:\n" + "\n".join(unsure)
+            await ctx.send(_truncate(msg, 1900), allowed_mentions=NO_MENTIONS)
+            return
+        lines = [
+            f"#{c.name} \N{RIGHTWARDS ARROW} {name}" + (f"@{env_name}" if env else "") for c, name, env, env_name in plan
+        ]
+        text = "I'll post a card and add a status dot in each of these:\n" + "\n".join(lines)
+        if unsure:
+            text += "\n\nSkipping these, which match more than one container:\n" + "\n".join(unsure)
+        for page in pagify(text, page_length=1800):
+            await ctx.send(box(page))
+        await ctx.send(f"Type `yes` within {CONFIRM_TIMEOUT} seconds to set up {len(plan)} channel(s).")
+        try:
+            reply = await self.bot.wait_for(
+                "message",
+                check=lambda m: m.author.id == ctx.author.id and m.channel.id == ctx.channel.id,
+                timeout=CONFIRM_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            await ctx.send("Nothing set up.")
+            return
+        if reply.content.strip().lower() not in ("yes", "y"):
+            await ctx.send("Nothing set up.")
+            return
+        done = []
+        async with ctx.typing():
+            for channel, name, env, _ in plan:
+                try:
+                    result = await self._setup_one(channel, name, env)
+                except (ArcaneError, SetupError) as e:
+                    result = f"skipped: {e}"
+                done.append(f"{channel.mention}: {result}")
         await ctx.send(
-            f"Card {card_id} is up in {channel.mention}. Add a link with "
-            f"`!containercard link {card_id} <url> [label]` and a description with "
-            f"`!containercard description {card_id} <text>`."
+            _truncate("\n".join(done), 1800)
+            + "\n\nAdd links with `!containercard link <card> <url>`. `!containercard list` shows the card numbers.",
+            allowed_mentions=NO_MENTIONS,
         )
 
     @containercard.command(name="title")
