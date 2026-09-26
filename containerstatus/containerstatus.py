@@ -34,16 +34,18 @@ DOT_UP = "\N{LARGE GREEN CIRCLE}"
 DOT_BUSY = "\N{LARGE ORANGE CIRCLE}"
 DOT_DOWN = "\N{LARGE RED CIRCLE}"
 DOT_UNKNOWN = "\N{MEDIUM WHITE CIRCLE}"
+DOT_UPDATE = "\N{LARGE BLUE CIRCLE}"  # up, with a newer image waiting
 COLOUR_UP = 0x7FA650
 COLOUR_BUSY = 0xD38B3A
 COLOUR_DOWN = 0xC4553F
 COLOUR_UNKNOWN = 0x8A8272
+COLOUR_UPDATE = 0x4A8FD4
 FOOTER = "Updated via Arcane"
 
 # Status dots in channel names, working the same way as the pzadmin cog's.
 DOT_PREFIX = re.compile(
     "^(?:\N{LARGE GREEN CIRCLE}|\N{LARGE RED CIRCLE}|\N{LARGE YELLOW CIRCLE}|\N{MEDIUM BLACK CIRCLE}"
-    "|\N{MEDIUM WHITE CIRCLE}|\N{LARGE ORANGE CIRCLE})[\\s\\-_|\N{BOX DRAWINGS HEAVY VERTICAL}"
+    "|\N{MEDIUM WHITE CIRCLE}|\N{LARGE ORANGE CIRCLE}|\N{LARGE BLUE CIRCLE})[\\s\\-_|\N{BOX DRAWINGS HEAVY VERTICAL}"
     "\N{KATAKANA MIDDLE DOT}\N{BULLET}]*"
 )
 DOT_SETTLE = 90  # a new state has to hold this long before the name follows
@@ -111,10 +113,25 @@ def wanted_dot(status: Optional[Dict[str, Any]]) -> Optional[str]:
         return DOT_DOWN
     state, health = status.get("state") or "", status.get("health") or ""
     if status.get("running") and state != "paused":
-        return DOT_BUSY if health in ("starting", "unhealthy") else DOT_UP
+        if health in ("starting", "unhealthy"):
+            return DOT_BUSY
+        return DOT_UPDATE if _update(status) else DOT_UP
     if state in ("restarting", "paused"):
         return DOT_BUSY
     return DOT_DOWN
+
+
+def _update(status: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Arcane's last image-update check for the container, if it found a newer image."""
+    info = _dict(status.get("updateInfo"))
+    return info if info.get("hasUpdate") and not info.get("error") else None
+
+
+def _update_line(info: Dict[str, Any]) -> str:
+    current, latest = str(info.get("currentVersion") or ""), str(info.get("latestVersion") or "")
+    if current and latest and current != latest:
+        return f"Update available: `{_truncate(current, 40)}` \N{RIGHTWARDS ARROW} `{_truncate(latest, 40)}`"
+    return "Update available: a newer image for this tag"
 
 
 def _base_name(name: str) -> str:
@@ -167,11 +184,15 @@ def render(card: Dict[str, Any], status: Optional[Dict[str, Any]]) -> Dict[str, 
                 colour, head = COLOUR_BUSY, f"{DOT_BUSY} **Starting**"
             elif health == "unhealthy":
                 colour, head = COLOUR_BUSY, f"{DOT_BUSY} **Unhealthy**"
+            elif _update(status):
+                colour, head = COLOUR_UPDATE, f"{DOT_UPDATE} **Online**"
             else:
                 colour, head = COLOUR_UP, f"{DOT_UP} **Online**"
             lines.append(head)
             if started:
                 lines.append("Up since " + _discord_time(started))
+            if _update(status):
+                lines.append(_update_line(_update(status)))
         elif state in ("restarting", "paused"):
             colour = COLOUR_BUSY
             lines.append(f"{DOT_BUSY} **{state.capitalize()}**")
@@ -327,22 +348,27 @@ class ContainerStatus(commands.Cog):
     async def _statuses(self, env: str, names: List[str]) -> Dict[str, Dict[str, Any]]:
         """Details for each named container in one environment. Raises ArcaneError if it can't be read."""
         ids: Dict[str, str] = {}
+        updates: Dict[str, Any] = {}
         for summary in await self._list(env):
             for name in self._names(summary):
                 ids.setdefault(name, str(summary.get("id") or ""))
+                updates.setdefault(name, summary.get("updateInfo"))
         out: Dict[str, Dict[str, Any]] = {}
         for name in set(names):
             if not ids.get(name):
                 out[name] = {"missing": True}
                 continue
             data = await self._get(await self._env_path(env, "/containers/" + quote(ids[name], safe="")))
-            state = _dict(_dict(_dict(data).get("data")).get("state"))
+            details = _dict(_dict(data).get("data"))
+            state = _dict(details.get("state"))
             out[name] = {
                 "state": state.get("status"),
                 "running": bool(state.get("running")),
                 "health": _dict(state.get("health")).get("status"),
                 "startedAt": state.get("startedAt"),
                 "finishedAt": state.get("finishedAt"),
+                # Arcane's stored result from its own scheduled image-update checks.
+                "updateInfo": details.get("updateInfo") or updates.get(name),
             }
         return out
 
@@ -792,7 +818,8 @@ class ContainerStatus(commands.Cog):
     async def cc_dots(self, ctx: commands.Context) -> None:
         """Show a card's status as \N{LARGE GREEN CIRCLE} / \N{LARGE ORANGE CIRCLE} / \N{LARGE RED CIRCLE} at the start of a channel's name.
 
-        \N{LARGE ORANGE CIRCLE} means starting, restarting, paused or unhealthy.
+        \N{LARGE ORANGE CIRCLE} means starting, restarting, paused or unhealthy. \N{LARGE BLUE CIRCLE} means up, with an image
+        update waiting (from Arcane's own update checks).
         """
 
     @cc_dots.command(name="add")
@@ -876,8 +903,26 @@ class ContainerStatus(commands.Cog):
             where = channel.mention if channel else f"deleted channel {channel_id}"
             card = cards.get(str(card_id))
             what = (card.get("title") or card["container"]) if card else "a removed card"
-            lines.append(f"{where} \N{RIGHTWARDS ARROW} card {card_id}, {discord.utils.escape_markdown(what)}")
+            line = f"{where} \N{RIGHTWARDS ARROW} card {card_id}, {discord.utils.escape_markdown(what)}"
+            ds = self._dots.get(int(channel_id))
+            if ds is not None and ds.want and ds.want != ds.shown:
+                line += f" (changing to {ds.want} {self._dot_eta(ds)})"
+            lines.append(line)
         await ctx.send(_truncate("\n".join(lines), 1900), allowed_mentions=NO_MENTIONS)
+
+    @staticmethod
+    def _dot_eta(ds: _DotState) -> str:
+        """When a waiting dot can go up, in words."""
+        now = time.monotonic()
+        settle = ds.want_since + DOT_SETTLE if DOT_BUSY not in (ds.want, ds.shown) else 0
+        limit = ds.retry_at
+        if not ds.budget(now):
+            limit = max(limit, min(ds.renames) + RENAME_WINDOW)
+        wait = int(max(settle, limit) - now)
+        if wait <= POLL_EVERY:
+            return "on the next check"
+        why = "Discord allows two renames every ten minutes" if limit >= settle else "making sure it isn't a blip"
+        return f"in about {max(1, round(wait / 60))} min, {why}"
 
     @containercard.command(name="refresh")
     async def cc_refresh(self, ctx: commands.Context) -> None:
