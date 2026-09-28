@@ -344,6 +344,8 @@ class PZAdmin(commands.Cog):
                 detail = f"{s.get('playerCount', 0)}/{s.get('maxPlayers', '?')} players"
             else:
                 detail = state
+            if s.get("slot"):
+                detail += f" - slot {s['slot']}, port {s.get('port')}"
             lines.append(f"{_icon(s)} **{name}** - {detail}")
         embed = discord.Embed(
             title="Project Zomboid servers",
@@ -379,6 +381,12 @@ class PZAdmin(commands.Cog):
         if s.get("address"):
             addr = f"{s['address']}:{s['port']}" if s.get("port") else str(s["address"])
             embed.add_field(name="Address", value=f"`{_truncate(addr, 200)}`")
+        # Port slots: PZAdmin moves the server between a few shared ports and
+        # reports where it is, so the port above is always the current one.
+        if s.get("slot"):
+            embed.add_field(name="Port slot", value=f"Slot {s['slot']} (port {s.get('port')})")
+        elif s.get("lastSlot"):
+            embed.add_field(name="Port slot", value=f"None while stopped (last used slot {s['lastSlot']})")
         if s.get("latencyMs") is not None:
             embed.add_field(name="Latency", value=f"{s['latencyMs']} ms")
         mods = f"{s.get('modsEnabled', 0)} enabled"
