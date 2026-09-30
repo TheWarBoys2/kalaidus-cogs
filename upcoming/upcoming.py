@@ -291,6 +291,20 @@ def _discord_id(value: Any) -> Optional[str]:
     return text if text.isdigit() and 15 <= len(text) <= 21 else None
 
 
+def _settings_discord_id(settings: Dict[str, Any]) -> Optional[str]:
+    """The first Discord ID in a Seerr user's settings.
+
+    Seerr 3.3 and later keep a list ("discordIds"); Overseerr, Jellyseerr and
+    older Seerr keep one ("discordId").
+    """
+    ids = settings.get("discordIds")
+    for value in (ids if isinstance(ids, list) else [ids]) + [settings.get("discordId")]:
+        found = _discord_id(value)
+        if found:
+            return found
+    return None
+
+
 def render_soon(
     movies: Optional[List[Dict[str, Any]]],
     requests: Optional[List[Dict[str, Any]]],
@@ -448,7 +462,7 @@ class Upcoming(commands.Cog):
         Some Seerr versions include it with the request; otherwise it's asked for
         once per user and remembered until `!upcoming refresh` or a reload.
         """
-        found = _discord_id(_dict(user.get("settings")).get("discordId"))
+        found = _settings_discord_id(_dict(user.get("settings")))
         uid = user.get("id")
         if found or not isinstance(uid, int):
             return found
@@ -457,7 +471,7 @@ class Upcoming(commands.Cog):
                 data = _dict(await self._get("seerr", f"/user/{uid}/settings/notifications"))
             except ServiceError:
                 return None  # try again next check
-            self._discord_ids[uid] = _discord_id(data.get("discordId"))
+            self._discord_ids[uid] = _settings_discord_id(data)
         return self._discord_ids[uid]
 
     async def _title(self, kind: str, tmdb: Any) -> Tuple[Optional[str], Optional[str]]:
