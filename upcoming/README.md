@@ -1,8 +1,9 @@
 # upcoming
 
-Keeps two messages in one channel up to date with what's coming to your media server. They only list things that are still on the way: anything Radarr or Sonarr already has the file for is left off, and physical (disc) release dates are ignored because a disc release doesn't put anything on the server.
+Keeps two messages in one channel up to date with what's coming to your media server. Apart from the "Added today" section, they only list things that are still on the way: anything Radarr or Sonarr already has the file for is left off, and physical (disc) release dates are ignored because a disc release doesn't put anything on the server.
 
 - **🎬 Out digitally soon**: movies in Radarr whose digital release is in the next 30 days (you can pick 7 to 90), grouped under a heading per day with how many days away it is. Each movie links to TMDB. Up to 20 are listed, soonest first, with the first one's poster.
+- **✅ Added today**, at the top of the week message: movies and episodes Radarr and Sonarr imported since midnight in your timezone, newest first, with a show's episodes on one line. It comes from their history, so it includes anything imported today, even an old film someone just requested. A quality upgrade of something already in the library counts as an import too, so it can show up here.
 - **📺 New episodes this week** (with Sonarr set up): today and the next six days, each day listing new episodes with the air time first, in each reader's own timezone. Several episodes of one show on one day go on one line. Days with nothing on are left off. Without Sonarr, this message is **🗓️ Coming up this week** and lists the week's digital movie releases instead.
 - Below the days, if Seerr is set up: **📥 Requested and on the way**, the approved requests that aren't in the library yet and who asked for them. If the requester has saved their Discord ID in Seerr (their profile → Notifications → Discord), they're shown as a Discord mention, otherwise by their Seerr name. The mention never pings anyone: the bot posts with pings turned off, and the message is edited rather than reposted. Movies Radarr has a digital date for come first, soonest first, with "out …" and the date. Requests still waiting for approval aren't shown, since they may never be added.
 
@@ -12,7 +13,7 @@ The bot only reads from Radarr, Sonarr and Seerr. It can't approve requests or c
 
 - It only knows about movies Radarr is **monitoring**, not every film coming out. The same goes for Sonarr and monitored series.
 - The Seerr section looks at Seerr's 100 most recent requests. Seerr gives TMDB IDs rather than titles, so the cog asks Seerr for each title once and remembers it until `!upcoming refresh` or a reload.
-- Release dates are whole days in Radarr and are shown as written. Your timezone only decides which day an episode falls on and what counts as "today".
+- Release dates are whole days in Radarr and are shown as written. Your timezone only decides which day an episode falls on and what counts as "today", including for "Added today".
 
 ## Setup
 
@@ -68,7 +69,9 @@ All `GET`, with the key in an `X-Api-Key` header:
 | Service | Call | Used for |
 | --- | --- | --- |
 | Radarr | `/api/v3/calendar` (monitored only) | Digital release dates, whether the file is in the library |
+| Radarr | `/api/v3/history/since` (with movie) | Movies imported since midnight |
 | Sonarr | `/api/v3/calendar` (monitored only, with series) | Episodes airing this week, whether the file is in the library |
+| Sonarr | `/api/v3/history/since` (with series and episode) | Episodes imported since midnight |
 | Seerr | `/api/v1/request` | The 100 most recent requests |
 | Seerr | `/api/v1/movie/{tmdb id}`, `/api/v1/tv/{tmdb id}` | Titles and years for the approved requests |
 | Seerr | `/api/v1/user/{id}/settings/notifications` | A requester's Discord ID, when Seerr didn't include it with the request. Asked once per requester |
