@@ -2,10 +2,16 @@
 
 Keeps two messages in one channel up to date with what's coming to your media server. Apart from the "Added today" section, they only list things that are still on the way: anything Radarr or Sonarr already has the file for is left off, and physical (disc) release dates are ignored because a disc release doesn't put anything on the server.
 
-- **🎬 Out digitally soon**: movies in Radarr whose digital release is in the next 30 days (you can pick 7 to 90), grouped under a heading per day with how many days away it is. Each movie links to TMDB. Up to 20 are listed, soonest first, with the first one's poster.
-- **✅ Added today**, at the top of the week message: movies and episodes Radarr and Sonarr imported since midnight in your timezone, newest first, with a show's episodes on one line. It comes from their history, so it includes anything imported today, even an old film someone just requested. A quality upgrade of something already in the library counts as an import too, so it can show up here.
-- **📺 New episodes this week** (with Sonarr set up): today and the next six days, each day listing new episodes with the air time first, in each reader's own timezone. Several episodes of one show on one day go on one line. Days with nothing on are left off. Without Sonarr, this message is **🗓️ Coming up this week** and lists the week's digital movie releases instead.
-- Below the days, if Seerr is set up: **📥 Requested and on the way**, the approved requests that aren't in the library yet and who asked for them. If the requester has saved their Discord ID in Seerr (their profile → Notifications → Discord), they're shown as a Discord mention, otherwise by their Seerr name. The mention never pings anyone: the bot posts with pings turned off, and the message is edited rather than reposted. Movies Radarr has a digital date for come first, soonest first, with "out …" and the date. Requests still waiting for approval aren't shown, since they may never be added.
+Each message is split into sections with a heading and a gap between them, and every line starts with 🎬 for a movie or 📺 for a show.
+
+- **🗓️ This week**:
+  - **✅ Added today**: movies and episodes Radarr and Sonarr imported since midnight in your timezone, newest first, with a show's episodes on one line (like *S11E26–E37*). It comes from their history, so it includes anything imported today, even an old film someone just requested. A quality upgrade of something already in the library counts as an import too, so it can show up here.
+  - Then a heading for each day from today to six days ahead that has something due (like "Tomorrow · Thursday 1st October"): digital movie releases first, then new episodes with their air time in each reader's own timezone. Days with nothing due are left off.
+- **🎬 Coming later**:
+  - Movies out digitally after this week, up to 30 days ahead (you can pick 7 to 90), under a heading per day with how many days away it is, and the first one's poster.
+  - **📥 Requested and on the way**, if Seerr is set up: approved requests that aren't in the library yet and who asked for them. Movies Radarr has a digital date for come first, soonest first, with "out …" and the date. If the requester has saved their Discord ID in Seerr (their profile → Notifications → Discord), they're shown as a Discord mention, otherwise by their Seerr name. The mention never pings anyone: the bot posts with pings turned off, and the message is edited rather than reposted. Requests still waiting for approval aren't shown, since they may never be added.
+
+If a section gets too long for one Discord message, each section is cut shorter and ends with "…and N more".
 
 The bot only reads from Radarr, Sonarr and Seerr. It can't approve requests or change anything.
 
@@ -33,7 +39,7 @@ The bot only reads from Radarr, Sonarr and Seerr. It can't approve requests or c
    !set api seerr url <seerr url> api_key <key>
    ```
 
-   Radarr is the one that matters. Sonarr and Seerr are optional: leave Seerr out and the requests section is left off; leave Sonarr out and the week message lists movies instead of episodes. The URL is the address you open each one at; `/api/v3` (Radarr, Sonarr) or `/api/v1` (Seerr) is added if you leave it off.
+   Radarr is the one that matters. Sonarr and Seerr are optional: leave either out and its part of the messages is simply left off. The URL is the address you open each one at; `/api/v3` (Radarr, Sonarr) or `/api/v1` (Seerr) is added if you leave it off.
 3. **Check them** with `!upcoming show`.
 4. **Set your timezone**: `!upcoming timezone Europe/London`. It's UTC until you do.
 5. **Post the messages**: `!upcoming setup #channel`. The bot needs View Channel, Send Messages and Embed Links there.
@@ -48,7 +54,7 @@ All bot owner only and prefix only.
 | --- | --- |
 | `!upcoming setup #channel` | Posts both messages there. If they were somewhere else, the old ones are deleted first |
 | `!upcoming remove` | Deletes both messages and stops updating them |
-| `!upcoming days <7-90>` | How far ahead "Out digitally soon" looks. Default 30 |
+| `!upcoming days <7-90>` | How far ahead "Coming later" lists movies. Default 30 |
 | `!upcoming timezone <name>` | Sets the timezone, e.g. `Europe/London` or `America/New_York`. Alias `tz` |
 | `!upcoming refresh` | Checks everything and updates the messages now, and forgets remembered Seerr titles and Discord IDs |
 | `!upcoming show` | Channel, days, timezone, and a live check of each service. Never shows the keys |
@@ -79,4 +85,4 @@ All `GET`, with the key in an `X-Api-Key` header:
 
 ## What it stores
 
-The channel, the two message IDs, days ahead and timezone. Seerr requester names and Discord IDs are shown on the week message but not stored; the IDs are remembered in memory until `!upcoming refresh` or a reload.
+The channel, the two message IDs, days ahead and timezone. Seerr requester names and Discord IDs are shown on the "Coming later" message but not stored; the IDs are remembered in memory until `!upcoming refresh` or a reload.
