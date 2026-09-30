@@ -1,16 +1,17 @@
 # upcoming
 
-Keeps two messages in one channel up to date with what's coming to your media server:
+Keeps two messages in one channel up to date with what's coming to your media server. They only list things that are still on the way: anything Radarr or Sonarr already has the file for is left off, and physical (disc) release dates are ignored because a disc release doesn't put anything on the server.
 
-- **🎬 Out digitally soon**: movies in Radarr whose digital release is in the next 30 days (you can pick 7 to 90). Each shows the date, how many days away it is, a link to TMDB, and "✅ in library" if Radarr already has the file. Up to 20 are listed, soonest first, with the first one's poster.
-- **🗓️ Coming up this week**: today and the next six days. Each day lists Radarr's digital and physical releases and, if Sonarr is set up, new episodes (several episodes of one show on one day go on one line, with the air time in each reader's own timezone). Below that, if Seerr is set up: requests waiting for approval, and approved requests not in the library yet (with "out digitally …" when Radarr expects the movie this week or later).
+- **🎬 Out digitally soon**: movies in Radarr whose digital release is in the next 30 days (you can pick 7 to 90), grouped under a heading per day with how many days away it is. Each movie links to TMDB. Up to 20 are listed, soonest first, with the first one's poster.
+- **📺 New episodes this week** (with Sonarr set up): today and the next six days, each day listing new episodes with the air time first, in each reader's own timezone. Several episodes of one show on one day go on one line. Days with nothing on are left off. Without Sonarr, this message is **🗓️ Coming up this week** and lists the week's digital movie releases instead.
+- Below the days, if Seerr is set up: **📥 Requested and on the way**, the approved requests that aren't in the library yet and who asked for them. Movies Radarr has a digital date for come first, soonest first, with "out …" and the date. Requests still waiting for approval aren't shown, since they may never be added.
 
 The bot only reads from Radarr, Sonarr and Seerr. It can't approve requests or change anything.
 
 ## What it can and can't know
 
 - It only knows about movies Radarr is **monitoring**, not every film coming out. The same goes for Sonarr and monitored series.
-- The Seerr sections look at Seerr's 100 most recent requests. Seerr gives TMDB IDs rather than titles, so the cog asks Seerr for each title once and remembers it until `!upcoming refresh` or a reload.
+- The Seerr section looks at Seerr's 100 most recent requests. Seerr gives TMDB IDs rather than titles, so the cog asks Seerr for each title once and remembers it until `!upcoming refresh` or a reload.
 - Release dates are whole days in Radarr and are shown as written. Your timezone only decides which day an episode falls on and what counts as "today".
 
 ## Setup
@@ -31,7 +32,7 @@ The bot only reads from Radarr, Sonarr and Seerr. It can't approve requests or c
    !set api seerr url <seerr url> api_key <key>
    ```
 
-   Radarr is the one that matters. Sonarr and Seerr are optional: leave either out and its part of the week message is simply left off. The URL is the address you open each one at; `/api/v3` (Radarr, Sonarr) or `/api/v1` (Seerr) is added if you leave it off.
+   Radarr is the one that matters. Sonarr and Seerr are optional: leave Seerr out and the requests section is left off; leave Sonarr out and the week message lists movies instead of episodes. The URL is the address you open each one at; `/api/v3` (Radarr, Sonarr) or `/api/v1` (Seerr) is added if you leave it off.
 3. **Check them** with `!upcoming show`.
 4. **Set your timezone**: `!upcoming timezone Europe/London`. It's UTC until you do.
 5. **Post the messages**: `!upcoming setup #channel`. The bot needs View Channel, Send Messages and Embed Links there.
@@ -66,10 +67,10 @@ All `GET`, with the key in an `X-Api-Key` header:
 
 | Service | Call | Used for |
 | --- | --- | --- |
-| Radarr | `/api/v3/calendar` (monitored only) | Digital and physical release dates, whether the file is in the library |
-| Sonarr | `/api/v3/calendar` (monitored only, with series) | Episodes airing this week |
+| Radarr | `/api/v3/calendar` (monitored only) | Digital release dates, whether the file is in the library |
+| Sonarr | `/api/v3/calendar` (monitored only, with series) | Episodes airing this week, whether the file is in the library |
 | Seerr | `/api/v1/request` | The 100 most recent requests |
-| Seerr | `/api/v1/movie/{tmdb id}`, `/api/v1/tv/{tmdb id}` | Titles and years for those requests |
+| Seerr | `/api/v1/movie/{tmdb id}`, `/api/v1/tv/{tmdb id}` | Titles and years for the approved requests |
 | Seerr | `/api/v1/request/count` | Only by `!upcoming show`, to check the key |
 
 ## What it stores

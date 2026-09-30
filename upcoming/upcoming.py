@@ -24,7 +24,7 @@ MIN_DAYS, MAX_DAYS = 7, 90
 WEEK = 7
 MAX_SOON = 20  # movies listed on the "out digitally soon" message
 MAX_PER_DAY = 8  # lines per day on the week message
-MAX_REQUESTS = 10  # lines per Seerr section
+MAX_REQUESTS = 10  # lines in the Seerr section
 SEERR_TAKE = 100  # most recent requests read from Seerr
 # Discord allows 6000 characters in an embed, so the week's fields share that out.
 DAY_LIMIT = 520
@@ -32,7 +32,6 @@ REQUEST_LIMIT = 700
 NO_MENTIONS = discord.AllowedMentions.none()
 
 # Seerr (and Overseerr / Jellyseerr before it) request and media status codes.
-REQUEST_PENDING = 1
 REQUEST_APPROVED = 2
 MEDIA_AVAILABLE = 5
 
@@ -40,7 +39,6 @@ COLOUR_SOON = 0x4A8FD4
 COLOUR_WEEK = 0x7FA650
 COLOUR_UNKNOWN = 0x8A8272
 DOT_STALE = "\N{MEDIUM WHITE CIRCLE}"
-IN_LIBRARY = "\N{WHITE HEAVY CHECK MARK} in library"
 
 SERVICES = {
     # shared token name -> (display name, API root under the URL)
@@ -163,17 +161,23 @@ def render_soon(
     end = today + timedelta(days=days)
     due: List[Tuple[date, str, Dict[str, Any]]] = []
     for movie in movies:
+        if movie.get("hasFile"):
+            continue  # already in the library, so nothing to wait for
         day = _release_day(movie.get("digitalRelease"))
         if day and today <= day <= end:
             due.append((day, str(movie.get("sortTitle") or movie.get("title") or ""), movie))
     due.sort(key=lambda d: (d[0], d[1]))
     if not due:
-        lines.append(f"Nothing in Radarr is due out digitally in the next {days} days.")
+        lines.append(f"Nothing new is due out digitally in the next {days} days.")
+    # One heading per day, with that day's movies under it.
     items = []
+    previous = None
     for day, _, movie in due:
-        line = f"{_movie_line(movie)} \N{MIDDLE DOT} {_short_date(day)}, {_day_label(day, today)}"
-        if movie.get("hasFile"):
-            line += f" \N{MIDDLE DOT} {IN_LIBRARY}"
+        line = _movie_line(movie)
+        if day != previous:
+            heading = f"**{_short_date(day)}** \N{MIDDLE DOT} {_day_label(day, today)}"
+            line = ("\n" if previous else "") + heading + "\n" + line
+            previous = day
         items.append(line)
     budget = 4000 - len("\n".join(lines))
     if items:
@@ -194,17 +198,20 @@ def _week_items(
 ) -> Dict[date, List[Tuple[str, str]]]:
     """Each day's lines for the week, as (sort key, line)."""
     days: Dict[date, List[Tuple[str, str]]] = {today + timedelta(days=i): [] for i in range(WEEK)}
+    # Only what's still to come: digital releases (physical ones never reach the
+    # server on their own) and nothing Radarr or Sonarr already has.
     for movie in movies or []:
-        for field, label in (("digitalRelease", "digital"), ("physicalRelease", "physical")):
-            day = _release_day(movie.get(field))
-            if day in days:
-                line = f"\N{CLAPPER BOARD} {_movie_line(movie, with_link=False)} \N{MIDDLE DOT} {label}"
-                if movie.get("hasFile"):
-                    line += f" \N{MIDDLE DOT} {IN_LIBRARY}"
-                days[day].append(("0" + str(movie.get("sortTitle") or movie.get("title") or ""), line))
+        if movie.get("hasFile"):
+            continue
+        day = _release_day(movie.get("digitalRelease"))
+        if day in days:
+            line = f"\N{CLAPPER BOARD} {_movie_line(movie, with_link=False)}"
+            days[day].append(("0" + str(movie.get("sortTitle") or movie.get("title") or ""), line))
     # Episodes of one show on one day go on one line.
     shows: Dict[Tuple[date, Any], List[Dict[str, Any]]] = {}
     for ep in episodes or []:
+        if ep.get("hasFile"):
+            continue
         aired = _parse_time(ep.get("airDateUtc"))
         if not aired:
             continue
@@ -218,12 +225,13 @@ def _week_items(
         series = _dict(first.get("series"))
         name = _escape(series.get("title") or first.get("title") or "Unknown show")
         code = f"S{first.get('seasonNumber') or 0:02d}E{first.get('episodeNumber') or 0:02d}"
-        if len(eps) > 1:
-            code += f"\N{EN DASH}E{last.get('episodeNumber') or 0:02d} ({len(eps)} episodes)"
+        if len(eps) > 1 and last.get("seasonNumber") == first.get("seasonNumber"):
+            code += f"\N{EN DASH}E{last.get('episodeNumber') or 0:02d}"
+        elif len(eps) > 1:
+            code += f" +{len(eps) - 1}"
         aired = _parse_time(first.get("airDateUtc"))
-        line = f"\N{TELEVISION} **{name}** {code} \N{MIDDLE DOT} <t:{int(aired.timestamp())}:t>"
-        if all(e.get("hasFile") for e in eps):
-            line += f" \N{MIDDLE DOT} {IN_LIBRARY}"
+        # The air time leads, so a day reads like a TV guide.
+        line = f"<t:{int(aired.timestamp())}:t> **{name}** {code}"
         days[day].append(("1" + aired.isoformat() + name, line))
     return days
 
@@ -232,10 +240,10 @@ def _request_line(req: Dict[str, Any], note: str = "") -> str:
     kind = "\N{TELEVISION}" if req.get("type") == "tv" else "\N{CLAPPER BOARD}"
     title = _escape(_truncate(req.get("title") or "Unknown title", 80))
     who = _dict(req.get("requestedBy")).get("displayName")
-    line = f"{kind} **{title}**" + (f" ({req['year']})" if req.get("year") else "")
+    line = f"{kind} **{title}**" + (f" ({req['year']})" if req.get("year") else "") + note
     if who:
-        line += f" \N{MIDDLE DOT} {_escape(_truncate(str(who), 40))}"
-    return line + note
+        line += f" \N{MIDDLE DOT} for {_escape(_truncate(str(who), 40))}"
+    return line
 
 
 def render_week(
@@ -246,17 +254,26 @@ def render_week(
     tz: ZoneInfo,
     sources: List[str],
     problems: List[str],
+    tv: bool = False,
 ) -> Dict[str, Any]:
     """The week-ahead message, as an embed dict without a timestamp.
 
     Each input is None when that service isn't set up or has never answered.
+    With tv (Sonarr is set up) the days list only episodes, since the movies
+    are on the "out digitally soon" message already; without it they list movies.
     """
     fields: List[Dict[str, Any]] = []
-    for day, items in _week_items(movies, episodes, today, tz).items():
+    listed = None if tv else movies
+    for day, items in _week_items(listed, episodes, today, tz).items():
+        if not items:
+            continue  # quiet days are left off rather than saying so
         label = {0: "Today \N{MIDDLE DOT} ", 1: "Tomorrow \N{MIDDLE DOT} "}.get((day - today).days, "")
         items.sort()
-        value = _limit_lines([line for _, line in items], MAX_PER_DAY, DAY_LIMIT) or "Nothing due"
+        value = _limit_lines([line for _, line in items], MAX_PER_DAY, DAY_LIMIT)
         fields.append({"name": label + _short_date(day), "value": value, "inline": False})
+    lines = list(problems)
+    if not fields and (listed is not None or episodes is not None):
+        lines.append("No new episodes this week." if tv else "Nothing new is due this week.")
     if requests is not None:
         # A movie Radarr expects out digitally this week says so.
         due = {
@@ -264,35 +281,31 @@ def render_week(
             for m in movies or []
             if m.get("tmdbId")
         }
-        waiting, coming = [], []
-        for req in requests:
-            status = req.get("status")
+        # Approved requests that aren't in the library yet: the ones with a
+        # digital date first, soonest first, then the rest newest first.
+        coming: List[Tuple[Tuple[int, str], str]] = []
+        for n, req in enumerate(requests):
             media = _dict(req.get("media"))
-            if status == REQUEST_PENDING:
-                waiting.append(_request_line(req))
-            elif status == REQUEST_APPROVED and media.get("status") != MEDIA_AVAILABLE:
-                note = ""
-                day = due.get(media.get("tmdbId")) if req.get("type") == "movie" else None
-                if day and day >= today:
-                    note = f" \N{MIDDLE DOT} out digitally {_short_date(day)}"
-                coming.append(_request_line(req, note))
-        fields.append(
-            {
-                "name": f"\N{HOURGLASS WITH FLOWING SAND} Waiting for approval in Seerr ({len(waiting)})",
-                "value": _limit_lines(waiting, MAX_REQUESTS, REQUEST_LIMIT) or "None",
-                "inline": False,
-            }
-        )
-        fields.append(
-            {
-                "name": f"\N{INBOX TRAY} Approved, not in the library yet ({len(coming)})",
-                "value": _limit_lines(coming, MAX_REQUESTS, REQUEST_LIMIT) or "None",
-                "inline": False,
-            }
-        )
-    description = "\n".join(problems) if problems else None
+            if req.get("status") != REQUEST_APPROVED or media.get("status") == MEDIA_AVAILABLE:
+                continue
+            note, key = "", (1, f"{n:04d}")
+            day = due.get(media.get("tmdbId")) if req.get("type") == "movie" else None
+            if day and day >= today:
+                note = f" \N{MIDDLE DOT} out {_short_date(day)}"
+                key = (0, day.isoformat())
+            coming.append((key, _request_line(req, note)))
+        coming.sort(key=lambda c: c[0])
+        if coming:
+            fields.append(
+                {
+                    "name": f"\N{INBOX TRAY} Requested and on the way ({len(coming)})",
+                    "value": _limit_lines([line for _, line in coming], MAX_REQUESTS, REQUEST_LIMIT),
+                    "inline": False,
+                }
+            )
+    description = "\n".join(lines) if lines else None
     embed: Dict[str, Any] = {
-        "title": "\N{SPIRAL CALENDAR PAD} Coming up this week",
+        "title": "\N{TELEVISION} New episodes this week" if tv else "\N{SPIRAL CALENDAR PAD} Coming up this week",
         "color": COLOUR_WEEK if not problems else COLOUR_UNKNOWN,
         "fields": fields,
         "footer": {"text": ("From " + ", ".join(sources)) if sources else "No services set up"},
@@ -392,7 +405,7 @@ class Upcoming(commands.Cog):
         for req in results:
             media = _dict(req.get("media"))
             kind = "tv" if req.get("type") == "tv" else "movie"
-            if req.get("status") not in (REQUEST_PENDING, REQUEST_APPROVED) or media.get("status") == MEDIA_AVAILABLE:
+            if req.get("status") != REQUEST_APPROVED or media.get("status") == MEDIA_AVAILABLE:
                 continue  # only the ones that show up on the message need a title
             req = dict(req)
             req["title"], req["year"] = await self._title(kind, media.get("tmdbId"))
@@ -471,7 +484,7 @@ class Upcoming(commands.Cog):
         soon = render_soon(movies, today, days, radarr_problem)
         sources = [n for n, on in (("Radarr", radarr_on), ("Sonarr", sonarr_on), ("Seerr", seerr_on)) if on]
         problems = [p for p in (radarr_problem if radarr_on else None, sonarr_problem, seerr_problem) if p]
-        week = render_week(movies, episodes, requests, today, tz, sources, problems)
+        week = render_week(movies, episodes, requests, today, tz, sources, problems, tv=sonarr_on)
         week["footer"]["text"] += f" \N{MIDDLE DOT} days in {tz.key}"
         return {"soon": soon, "week": week}
 
