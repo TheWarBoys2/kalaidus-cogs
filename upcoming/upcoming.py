@@ -241,9 +241,18 @@ def _request_line(req: Dict[str, Any], note: str = "") -> str:
     title = _escape(_truncate(req.get("title") or "Unknown title", 80))
     who = _dict(req.get("requestedBy")).get("displayName")
     line = f"{kind} **{title}**" + (f" ({req['year']})" if req.get("year") else "") + note
-    if who:
+    if req.get("discord_id"):
+        # A mention in an embed shows as the person's name but never pings them.
+        line += f" \N{MIDDLE DOT} for <@{req['discord_id']}>"
+    elif who:
         line += f" \N{MIDDLE DOT} for {_escape(_truncate(str(who), 40))}"
     return line
+
+
+def _discord_id(value: Any) -> Optional[str]:
+    """A Discord user ID as Seerr stores it, or None if it doesn't look like one."""
+    text = str(value or "").strip()
+    return text if text.isdigit() and 15 <= len(text) <= 21 else None
 
 
 def render_week(
@@ -335,6 +344,7 @@ class Upcoming(commands.Cog):
         self._last: Dict[str, Any] = {}  # service -> last good answer
         self._failures: Dict[str, Dict[str, Any]] = {}  # service -> {count, since}
         self._titles: Dict[Tuple[str, Any], Tuple[str, Optional[str]]] = {}  # (movie|tv, TMDB ID) -> (title, year)
+        self._discord_ids: Dict[Any, Optional[str]] = {}  # Seerr user ID -> their Discord ID, if set
 
     async def cog_load(self) -> None:
         self._session = aiohttp.ClientSession()
@@ -409,8 +419,27 @@ class Upcoming(commands.Cog):
                 continue  # only the ones that show up on the message need a title
             req = dict(req)
             req["title"], req["year"] = await self._title(kind, media.get("tmdbId"))
+            req["discord_id"] = await self._requester_discord(_dict(req.get("requestedBy")))
             out.append(req)
         return out
+
+    async def _requester_discord(self, user: Dict[str, Any]) -> Optional[str]:
+        """The Discord ID a Seerr user saved in their notification settings, if any.
+
+        Some Seerr versions include it with the request; otherwise it's asked for
+        once per user and remembered until `!upcoming refresh` or a reload.
+        """
+        found = _discord_id(_dict(user.get("settings")).get("discordId"))
+        uid = user.get("id")
+        if found or not isinstance(uid, int):
+            return found
+        if uid not in self._discord_ids:
+            try:
+                data = _dict(await self._get("seerr", f"/user/{uid}/settings/notifications"))
+            except ServiceError:
+                return None  # try again next check
+            self._discord_ids[uid] = _discord_id(data.get("discordId"))
+        return self._discord_ids[uid]
 
     async def _title(self, kind: str, tmdb: Any) -> Tuple[Optional[str], Optional[str]]:
         """(title, year) for a TMDB ID. Seerr's requests carry IDs, not titles; Seerr looks them up."""
@@ -622,6 +651,7 @@ class Upcoming(commands.Cog):
             await ctx.send("Nothing is set up yet. Start with `!upcoming setup #channel`.")
             return
         self._titles.clear()
+        self._discord_ids.clear()
         async with ctx.typing():
             await self._sync(force=True)
         await ctx.tick()
