@@ -25,6 +25,11 @@ WEEK = 7
 MAX_SOON = 20  # movies listed on the "out digitally soon" message
 MAX_PER_DAY = 8  # lines per day on the week message
 MAX_REQUESTS = 10  # lines in the Seerr section
+MAX_ADDED = 12  # lines in "Added today"
+ADDED_LIMIT = 900
+# History events that mean a file landed in the library: a finished download, or
+# a folder imported by hand.
+IMPORTED = {"downloadFolderImported", "movieFolderImported", "seriesFolderImported"}
 SEERR_TAKE = 100  # most recent requests read from Seerr
 # Discord allows 6000 characters in an embed, so the week's fields share that out.
 DAY_LIMIT = 520
@@ -255,6 +260,41 @@ def _discord_id(value: Any) -> Optional[str]:
     return text if text.isdigit() and 15 <= len(text) <= 21 else None
 
 
+def _added_lines(
+    movie_history: Optional[List[Dict[str, Any]]],
+    episode_history: Optional[List[Dict[str, Any]]],
+) -> List[str]:
+    """One line per movie and per show imported, from Radarr's and Sonarr's history."""
+    lines: List[Tuple[str, str]] = []
+    seen = set()
+    for rec in movie_history or []:
+        movie = _dict(rec.get("movie"))
+        key = rec.get("movieId") or movie.get("tmdbId") or movie.get("title")
+        if rec.get("eventType") not in IMPORTED or not movie or key in seen:
+            continue
+        seen.add(key)
+        lines.append((str(rec.get("date") or ""), f"\N{CLAPPER BOARD} {_movie_line(movie, with_link=False)}"))
+    shows: Dict[Any, List[Dict[str, Any]]] = {}
+    for rec in episode_history or []:
+        if rec.get("eventType") in IMPORTED and rec.get("series") and rec.get("episode"):
+            shows.setdefault(rec.get("seriesId") or _dict(rec["series"]).get("title"), []).append(rec)
+    for recs in shows.values():
+        eps = {}
+        for rec in recs:
+            ep = _dict(rec.get("episode"))
+            eps[(ep.get("seasonNumber") or 0, ep.get("episodeNumber") or 0)] = rec
+        numbers = sorted(eps)
+        (s1, e1), (s2, e2) = numbers[0], numbers[-1]
+        code = f"S{s1:02d}E{e1:02d}"
+        if len(numbers) > 1:
+            code += f"\N{EN DASH}E{e2:02d}" if s1 == s2 else f" +{len(numbers) - 1}"
+        name = _escape(_dict(recs[0].get("series")).get("title") or "Unknown show")
+        latest = max(str(r.get("date") or "") for r in recs)
+        lines.append((latest, f"\N{TELEVISION} **{name}** {code}"))
+    lines.sort(key=lambda item: item[0], reverse=True)  # newest first
+    return [line for _, line in lines]
+
+
 def render_week(
     movies: Optional[List[Dict[str, Any]]],
     episodes: Optional[List[Dict[str, Any]]],
@@ -264,6 +304,7 @@ def render_week(
     sources: List[str],
     problems: List[str],
     tv: bool = False,
+    added: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """The week-ahead message, as an embed dict without a timestamp.
 
@@ -272,6 +313,14 @@ def render_week(
     are on the "out digitally soon" message already; without it they list movies.
     """
     fields: List[Dict[str, Any]] = []
+    if added:
+        fields.append(
+            {
+                "name": f"\N{WHITE HEAVY CHECK MARK} Added today ({len(added)})",
+                "value": _limit_lines(added, MAX_ADDED, ADDED_LIMIT),
+                "inline": False,
+            }
+        )
     listed = None if tv else movies
     for day, items in _week_items(listed, episodes, today, tz).items():
         if not items:
@@ -457,25 +506,41 @@ class Upcoming(commands.Cog):
             self._titles[(kind, tmdb)] = (str(title), year if year.isdigit() else None)
         return self._titles[(kind, tmdb)]
 
-    async def _fetch(self, service: str, call) -> Tuple[Any, Optional[str], bool]:
-        """(data, problem line, set up). Keeps the last good answer when a check fails."""
+    async def _history(self, service: str, since: datetime) -> List[Dict[str, Any]]:
+        """Radarr's or Sonarr's history since a time (imports are picked out later)."""
+        params = {"date": since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        if service == "radarr":
+            params["includeMovie"] = "true"
+        else:
+            params.update(includeSeries="true", includeEpisode="true")
+        data = await self._get(service, "/history/since", params)
+        if not isinstance(data, list):
+            raise ServiceError(f"{SERVICES[service][0]}'s history wasn't a list.")
+        return [i for i in data if isinstance(i, dict)]
+
+    async def _fetch(self, service: str, call, key: Optional[str] = None) -> Tuple[Any, Optional[str], bool]:
+        """(data, problem line, set up). Keeps the last good answer when a check fails.
+
+        key keeps a second call to the same service (its history) apart from the first.
+        """
         name = SERVICES[service][0]
+        key = key or service
         try:
             data = await call()
         except NotSetUp:
-            self._last.pop(service, None)
-            self._failures.pop(service, None)
+            self._last.pop(key, None)
+            self._failures.pop(key, None)
             return None, None, False
         except ServiceError as e:
-            f = self._failures.setdefault(service, {"count": 0, "since": time.time()})
+            f = self._failures.setdefault(key, {"count": 0, "since": time.time()})
             f["count"] += 1
             log.debug("Upcoming: can't read %s: %s", name, e)
             note = _stale_note(name, f)
-            if service not in self._last:
+            if key not in self._last:
                 return None, f"{DOT_STALE} {e}", True
-            return self._last[service], note, True
-        self._failures.pop(service, None)
-        self._last[service] = data
+            return self._last[key], note, True
+        self._failures.pop(key, None)
+        self._last[key] = data
         return data, None, True
 
     async def _tz(self) -> ZoneInfo:
@@ -508,12 +573,26 @@ class Upcoming(commands.Cog):
             "sonarr", lambda: self._calendar("sonarr", start, today + timedelta(days=WEEK + 1))
         )
         requests, seerr_problem, seerr_on = await self._fetch("seerr", self._requests)
+        # What landed in the library since midnight. A failed history check just
+        # leaves the section off (or as it last was); the calendar's note covers
+        # a service that's down.
+        midnight = datetime.combine(today, datetime.min.time(), tzinfo=tz)
+        movie_history = episode_history = None
+        if radarr_on:
+            movie_history, _, _ = await self._fetch("radarr", lambda: self._history("radarr", midnight), "radarr-history")
+        if sonarr_on:
+            episode_history, _, _ = await self._fetch(
+                "sonarr", lambda: self._history("sonarr", midnight), "sonarr-history"
+            )
+        # A kept answer from before midnight mustn't carry yesterday over.
+        today_only = lambda recs: [r for r in recs or [] if (_parse_time(r.get("date")) or midnight) >= midnight]
+        added = _added_lines(today_only(movie_history), today_only(episode_history))
         if not radarr_on:
             radarr_problem = "Radarr isn't set up, so there's nothing to list. See `!upcoming show`."
         soon = render_soon(movies, today, days, radarr_problem)
         sources = [n for n, on in (("Radarr", radarr_on), ("Sonarr", sonarr_on), ("Seerr", seerr_on)) if on]
         problems = [p for p in (radarr_problem if radarr_on else None, sonarr_problem, seerr_problem) if p]
-        week = render_week(movies, episodes, requests, today, tz, sources, problems, tv=sonarr_on)
+        week = render_week(movies, episodes, requests, today, tz, sources, problems, tv=sonarr_on, added=added)
         week["footer"]["text"] += f" \N{MIDDLE DOT} days in {tz.key}"
         return {"soon": soon, "week": week}
 
