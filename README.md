@@ -8,7 +8,7 @@ Commands below use `!` as the prefix. Swap in your own if it's different.
 | --- | --- | --- | --- |
 | [pzadmin](pzadmin/README.md) | Project Zomboid server status, player lists, restarts, mod requests and status dots in channel names | [PZAdmin](https://github.com/TheWarBoys2/pzadmin)'s `/api/v1` | Anyone for status and requests; restarts need you to lock them down (see its README); settings are owner only |
 | [containerstatus](containerstatus/README.md) | Live status cards and channel-name dots for any Docker container | Arcane's API (read only) | Bot owner only |
-| [upcoming](upcoming/README.md) | Two live messages: movies out digitally soon, and the week ahead | Radarr, and optionally Sonarr and Seerr (read only) | Bot owner sets it up; everyone in the channel reads it |
+| [upcoming](upcoming/README.md) | Two live messages: this week (added today, then each day), and movies and requests coming later | Radarr, and optionally Sonarr and Seerr (read only) | Bot owner sets it up; everyone in the channel reads it |
 | [rolegate](rolegate/README.md) | A button panel for self-service roles, with moderator approval for some | Discord only | Admins or anyone with Manage Roles set it up; members click buttons |
 | [foundry](foundry/README.md) | Runs a Foundry VTT maintenance action (fix file permissions) | [OliveTin](https://www.olivetin.app/) | Anyone who can run the command (see its README) |
 

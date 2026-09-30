@@ -22,18 +22,12 @@ RETRY_FORBIDDEN = 600
 DEFAULT_DAYS = 30
 MIN_DAYS, MAX_DAYS = 7, 90
 WEEK = 7
-MAX_SOON = 20  # movies listed on the "out digitally soon" message
-MAX_PER_DAY = 8  # lines per day on the week message
-MAX_REQUESTS = 10  # lines in the Seerr section
-MAX_ADDED = 12  # lines in "Added today"
-ADDED_LIMIT = 900
+MAX_PER_SECTION = 12  # lines under one heading before "…and N more"
+DESCRIPTION_LIMIT = 4000  # Discord allows 4096 characters in an embed description
 # History events that mean a file landed in the library: a finished download, or
 # a folder imported by hand.
 IMPORTED = {"downloadFolderImported", "movieFolderImported", "seriesFolderImported"}
 SEERR_TAKE = 100  # most recent requests read from Seerr
-# Discord allows 6000 characters in an embed, so the week's fields share that out.
-DAY_LIMIT = 520
-REQUEST_LIMIT = 700
 NO_MENTIONS = discord.AllowedMentions.none()
 
 # Seerr (and Overseerr / Jellyseerr before it) request and media status codes.
@@ -90,39 +84,50 @@ def _release_day(value: Any) -> Optional[date]:
     return dt.date() if dt else None
 
 
-def _day_label(day: date, today: date) -> str:
-    diff = (day - today).days
-    if diff == 0:
-        return "today"
-    if diff == 1:
-        return "tomorrow"
-    return f"in {diff} days"
+def _ordinal(n: int) -> str:
+    suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _long_date(day: date) -> str:
+    return f"{day:%A} {_ordinal(day.day)} {day:%B}"
 
 
 def _short_date(day: date) -> str:
     return f"{day:%a} {day.day} {day:%b}"
 
 
-def _limit_lines(lines: List[str], most: int, limit: int, more: str = "") -> str:
-    """Join lines, keeping under a character limit and adding "…and N more"."""
-    shown = lines[:most]
-    while True:
-        extra = len(lines) - len(shown)
-        tail = [f"\N{HORIZONTAL ELLIPSIS}and {extra} more{more}"] if extra else []
-        text = "\n".join(shown + tail)
-        if len(text) <= limit or not shown:
-            return _truncate(text, limit)
-        shown = shown[:-1]
+def _day_heading(day: date, today: date) -> str:
+    diff = (day - today).days
+    if diff == 0:
+        return f"Today \N{MIDDLE DOT} {_long_date(day)}"
+    if diff == 1:
+        return f"Tomorrow \N{MIDDLE DOT} {_long_date(day)}"
+    if diff < WEEK:
+        return _long_date(day)
+    return f"{_long_date(day)} \N{MIDDLE DOT} in {diff} days"
 
 
-def _movie_line(movie: Dict[str, Any], with_link: bool = True) -> str:
+def _movie_line(movie: Dict[str, Any]) -> str:
     title = _escape(movie.get("title") or "Untitled")
     year = movie.get("year")
-    name = f"**{title}**" + (f" ({year})" if year else "")
-    tmdb = movie.get("tmdbId")
-    if with_link and tmdb:
-        name = f"[{name}](https://www.themoviedb.org/movie/{tmdb})"
-    return name
+    return f"\N{CLAPPER BOARD} **{title}**" + (f" *({year})*" if year else "")
+
+
+def _episode_code(numbers: List[Tuple[int, int]]) -> str:
+    """S01E03, S02E01–E04 for a run in one season, or S01E10 +1 across seasons."""
+    (s1, e1), (s2, e2) = numbers[0], numbers[-1]
+    code = f"S{s1:02d}E{e1:02d}"
+    if len(numbers) > 1:
+        code += f"\N{EN DASH}E{e2:02d}" if s1 == s2 else f" +{len(numbers) - 1}"
+    return code
+
+
+def _show_line(name: str, numbers: List[Tuple[int, int]], aired: Optional[datetime] = None) -> str:
+    line = f"\N{TELEVISION} **{_escape(name)}** *{_episode_code(sorted(set(numbers)))}*"
+    if aired:
+        line += f" \N{MIDDLE DOT} <t:{int(aired.timestamp())}:t>"  # each reader's own time
+    return line
 
 
 def _poster(movie: Dict[str, Any]) -> Optional[str]:
@@ -142,110 +147,136 @@ def _stale_note(name: str, failure: Optional[Dict[str, Any]]) -> Optional[str]:
     return f"{DOT_STALE} {name} hasn't answered{when}, so this may be out of date."
 
 
-def render_soon(
-    movies: Optional[List[Dict[str, Any]]],
-    today: date,
-    days: int,
-    problem: Optional[str] = None,
-) -> Dict[str, Any]:
-    """The "out digitally soon" message, as an embed dict without a timestamp.
-
-    movies is Radarr's calendar (None if Radarr has never answered);
-    problem is a line to show above the list, if any.
-    """
-    embed: Dict[str, Any] = {
-        "title": "\N{CLAPPER BOARD} Out digitally soon",
-        "color": COLOUR_SOON,
-        "footer": {"text": f"From Radarr \N{MIDDLE DOT} next {days} days"},
-    }
-    lines: List[str] = [problem, ""] if problem else []
-    if movies is None:
-        embed["color"] = COLOUR_UNKNOWN
-        embed["description"] = "\n".join(lines).strip() or "Waiting for Radarr\N{HORIZONTAL ELLIPSIS}"
-        return embed
-    end = today + timedelta(days=days)
-    due: List[Tuple[date, str, Dict[str, Any]]] = []
-    for movie in movies:
-        if movie.get("hasFile"):
-            continue  # already in the library, so nothing to wait for
-        day = _release_day(movie.get("digitalRelease"))
-        if day and today <= day <= end:
-            due.append((day, str(movie.get("sortTitle") or movie.get("title") or ""), movie))
-    due.sort(key=lambda d: (d[0], d[1]))
-    if not due:
-        lines.append(f"Nothing new is due out digitally in the next {days} days.")
-    # One heading per day, with that day's movies under it.
-    items = []
-    previous = None
-    for day, _, movie in due:
-        line = _movie_line(movie)
-        if day != previous:
-            heading = f"**{_short_date(day)}** \N{MIDDLE DOT} {_day_label(day, today)}"
-            line = ("\n" if previous else "") + heading + "\n" + line
-            previous = day
-        items.append(line)
-    budget = 4000 - len("\n".join(lines))
-    if items:
-        lines.append(_limit_lines(items, MAX_SOON, budget))
-    embed["description"] = "\n".join(lines).strip()
-    if due:
-        poster = _poster(due[0][2])
-        if poster:
-            embed["thumbnail"] = {"url": poster}
-    return embed
+Section = Tuple[str, List[str]]  # (heading, lines)
 
 
-def _week_items(
-    movies: Optional[List[Dict[str, Any]]],
-    episodes: Optional[List[Dict[str, Any]]],
-    today: date,
-    tz: ZoneInfo,
-) -> Dict[date, List[Tuple[str, str]]]:
-    """Each day's lines for the week, as (sort key, line)."""
-    days: Dict[date, List[Tuple[str, str]]] = {today + timedelta(days=i): [] for i in range(WEEK)}
-    # Only what's still to come: digital releases (physical ones never reach the
-    # server on their own) and nothing Radarr or Sonarr already has.
+def _layout(top: List[str], sections: List[Section], empty: str) -> str:
+    """The description: any notes, then each section under a ### heading with a gap
+    between them. If it's too long for Discord, every section is cut shorter until it fits."""
+    most = MAX_PER_SECTION
+    while True:
+        parts = ["\n".join(top)] if top else []
+        for heading, lines in sections:
+            shown = lines[:most]
+            if len(lines) > most:
+                shown.append(f"-# \N{HORIZONTAL ELLIPSIS}and {len(lines) - most} more")
+            parts.append(f"### {heading}\n" + "\n".join(shown))
+        if not sections:
+            parts.append(empty)
+        text = "\n\n".join(parts)
+        if len(text) <= DESCRIPTION_LIMIT or most == 1:
+            return _truncate(text, DESCRIPTION_LIMIT)
+        most -= 1
+
+
+def _movies_by_day(movies: Optional[List[Dict[str, Any]]], first: date, last: date) -> Dict[date, List[Dict[str, Any]]]:
+    """Movies due out digitally from first to last, by day. Only what's still to
+    come: physical releases never reach the server on their own, and anything
+    Radarr already has is left off."""
+    days: Dict[date, List[Dict[str, Any]]] = {}
     for movie in movies or []:
         if movie.get("hasFile"):
             continue
         day = _release_day(movie.get("digitalRelease"))
-        if day in days:
-            line = f"\N{CLAPPER BOARD} {_movie_line(movie, with_link=False)}"
-            days[day].append(("0" + str(movie.get("sortTitle") or movie.get("title") or ""), line))
-    # Episodes of one show on one day go on one line.
-    shows: Dict[Tuple[date, Any], List[Dict[str, Any]]] = {}
+        if day and first <= day <= last:
+            days.setdefault(day, []).append(movie)
+    for day_movies in days.values():
+        day_movies.sort(key=lambda m: str(m.get("sortTitle") or m.get("title") or ""))
+    return days
+
+
+def _episodes_by_day(
+    episodes: Optional[List[Dict[str, Any]]], today: date, tz: ZoneInfo
+) -> Dict[date, List[Tuple[datetime, str]]]:
+    """This week's episodes not in the library yet, by day, as (air time, line).
+    Episodes of one show on one day go on one line."""
+    shows: Dict[Tuple[date, Any], List[Tuple[datetime, Dict[str, Any]]]] = {}
     for ep in episodes or []:
-        if ep.get("hasFile"):
-            continue
         aired = _parse_time(ep.get("airDateUtc"))
-        if not aired:
+        if ep.get("hasFile") or not aired:
             continue
         day = aired.astimezone(tz).date()
-        if day in days:
-            series = _dict(ep.get("series"))
-            shows.setdefault((day, ep.get("seriesId") or series.get("title")), []).append(ep)
+        if 0 <= (day - today).days < WEEK:
+            key = ep.get("seriesId") or _dict(ep.get("series")).get("title")
+            shows.setdefault((day, key), []).append((aired, ep))
+    days: Dict[date, List[Tuple[datetime, str]]] = {}
     for (day, _), eps in shows.items():
-        eps.sort(key=lambda e: (e.get("seasonNumber") or 0, e.get("episodeNumber") or 0))
-        first, last = eps[0], eps[-1]
-        series = _dict(first.get("series"))
-        name = _escape(series.get("title") or first.get("title") or "Unknown show")
-        code = f"S{first.get('seasonNumber') or 0:02d}E{first.get('episodeNumber') or 0:02d}"
-        if len(eps) > 1 and last.get("seasonNumber") == first.get("seasonNumber"):
-            code += f"\N{EN DASH}E{last.get('episodeNumber') or 0:02d}"
-        elif len(eps) > 1:
-            code += f" +{len(eps) - 1}"
-        aired = _parse_time(first.get("airDateUtc"))
-        # The air time leads, so a day reads like a TV guide.
-        line = f"<t:{int(aired.timestamp())}:t> **{name}** {code}"
-        days[day].append(("1" + aired.isoformat() + name, line))
+        eps.sort(key=lambda a: a[0])
+        first = eps[0][1]
+        name = _dict(first.get("series")).get("title") or first.get("title") or "Unknown show"
+        numbers = [(e.get("seasonNumber") or 0, e.get("episodeNumber") or 0) for _, e in eps]
+        days.setdefault(day, []).append((eps[0][0], _show_line(name, numbers, eps[0][0])))
     return days
+
+
+def _added_lines(
+    movie_history: Optional[List[Dict[str, Any]]],
+    episode_history: Optional[List[Dict[str, Any]]],
+) -> List[str]:
+    """One line per movie and per show imported, newest first, from Radarr's and Sonarr's history."""
+    lines: List[Tuple[str, str]] = []
+    seen = set()
+    for rec in movie_history or []:
+        movie = _dict(rec.get("movie"))
+        key = rec.get("movieId") or movie.get("tmdbId") or movie.get("title")
+        if rec.get("eventType") not in IMPORTED or not movie or key in seen:
+            continue
+        seen.add(key)
+        lines.append((str(rec.get("date") or ""), _movie_line(movie)))
+    shows: Dict[Any, List[Dict[str, Any]]] = {}
+    for rec in episode_history or []:
+        if rec.get("eventType") in IMPORTED and rec.get("series") and rec.get("episode"):
+            shows.setdefault(rec.get("seriesId") or _dict(rec["series"]).get("title"), []).append(rec)
+    for recs in shows.values():
+        numbers = [
+            (_dict(r["episode"]).get("seasonNumber") or 0, _dict(r["episode"]).get("episodeNumber") or 0)
+            for r in recs
+        ]
+        name = _dict(recs[0].get("series")).get("title") or "Unknown show"
+        latest = max(str(r.get("date") or "") for r in recs)
+        lines.append((latest, _show_line(name, numbers)))
+    lines.sort(key=lambda item: item[0], reverse=True)
+    return [line for _, line in lines]
+
+
+def render_week(
+    movies: Optional[List[Dict[str, Any]]],
+    episodes: Optional[List[Dict[str, Any]]],
+    added: List[str],
+    today: date,
+    tz: ZoneInfo,
+    sources: List[str],
+    problems: List[str],
+) -> Dict[str, Any]:
+    """The "this week" message, as an embed dict without a timestamp: what was
+    added today, then each day with something due (movies first, then episodes
+    by air time). movies and episodes are None when that service isn't set up
+    or has never answered."""
+    sections: List[Section] = []
+    if added:
+        sections.append(("\N{WHITE HEAVY CHECK MARK} Added today", added))
+    films = _movies_by_day(movies, today, today + timedelta(days=WEEK - 1))
+    shows = _episodes_by_day(episodes, today, tz)
+    for i in range(WEEK):
+        day = today + timedelta(days=i)
+        lines = [_movie_line(m) for m in films.get(day, [])]
+        lines += [line for _, line in sorted(shows.get(day, []), key=lambda s: s[0])]
+        if lines:  # quiet days are left off
+            sections.append((_day_heading(day, today), lines))
+    embed: Dict[str, Any] = {
+        "title": "\N{SPIRAL CALENDAR PAD} This week",
+        "color": COLOUR_WEEK if not problems else COLOUR_UNKNOWN,
+        "description": _layout(problems, sections, "Nothing new is due this week."),
+        "footer": {"text": ("From " + ", ".join(sources)) if sources else "No services set up"},
+    }
+    return embed
 
 
 def _request_line(req: Dict[str, Any], note: str = "") -> str:
     kind = "\N{TELEVISION}" if req.get("type") == "tv" else "\N{CLAPPER BOARD}"
     title = _escape(_truncate(req.get("title") or "Unknown title", 80))
     who = _dict(req.get("requestedBy")).get("displayName")
-    line = f"{kind} **{title}**" + (f" ({req['year']})" if req.get("year") else "") + note
+    line = f"{kind} **{title}**" + (f" *({req['year']})*" if req.get("year") else "") + note
     if req.get("discord_id"):
         # A mention in an embed shows as the person's name but never pings them.
         line += f" \N{MIDDLE DOT} for <@{req['discord_id']}>"
@@ -260,87 +291,35 @@ def _discord_id(value: Any) -> Optional[str]:
     return text if text.isdigit() and 15 <= len(text) <= 21 else None
 
 
-def _added_lines(
-    movie_history: Optional[List[Dict[str, Any]]],
-    episode_history: Optional[List[Dict[str, Any]]],
-) -> List[str]:
-    """One line per movie and per show imported, from Radarr's and Sonarr's history."""
-    lines: List[Tuple[str, str]] = []
-    seen = set()
-    for rec in movie_history or []:
-        movie = _dict(rec.get("movie"))
-        key = rec.get("movieId") or movie.get("tmdbId") or movie.get("title")
-        if rec.get("eventType") not in IMPORTED or not movie or key in seen:
-            continue
-        seen.add(key)
-        lines.append((str(rec.get("date") or ""), f"\N{CLAPPER BOARD} {_movie_line(movie, with_link=False)}"))
-    shows: Dict[Any, List[Dict[str, Any]]] = {}
-    for rec in episode_history or []:
-        if rec.get("eventType") in IMPORTED and rec.get("series") and rec.get("episode"):
-            shows.setdefault(rec.get("seriesId") or _dict(rec["series"]).get("title"), []).append(rec)
-    for recs in shows.values():
-        eps = {}
-        for rec in recs:
-            ep = _dict(rec.get("episode"))
-            eps[(ep.get("seasonNumber") or 0, ep.get("episodeNumber") or 0)] = rec
-        numbers = sorted(eps)
-        (s1, e1), (s2, e2) = numbers[0], numbers[-1]
-        code = f"S{s1:02d}E{e1:02d}"
-        if len(numbers) > 1:
-            code += f"\N{EN DASH}E{e2:02d}" if s1 == s2 else f" +{len(numbers) - 1}"
-        name = _escape(_dict(recs[0].get("series")).get("title") or "Unknown show")
-        latest = max(str(r.get("date") or "") for r in recs)
-        lines.append((latest, f"\N{TELEVISION} **{name}** {code}"))
-    lines.sort(key=lambda item: item[0], reverse=True)  # newest first
-    return [line for _, line in lines]
-
-
-def render_week(
+def render_soon(
     movies: Optional[List[Dict[str, Any]]],
-    episodes: Optional[List[Dict[str, Any]]],
     requests: Optional[List[Dict[str, Any]]],
     today: date,
-    tz: ZoneInfo,
-    sources: List[str],
-    problems: List[str],
-    tv: bool = False,
-    added: Optional[List[str]] = None,
+    days: int,
+    problems: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """The week-ahead message, as an embed dict without a timestamp.
-
-    Each input is None when that service isn't set up or has never answered.
-    With tv (Sonarr is set up) the days list only episodes, since the movies
-    are on the "out digitally soon" message already; without it they list movies.
-    """
-    fields: List[Dict[str, Any]] = []
-    if added:
-        fields.append(
-            {
-                "name": f"\N{WHITE HEAVY CHECK MARK} Added today ({len(added)})",
-                "value": _limit_lines(added, MAX_ADDED, ADDED_LIMIT),
-                "inline": False,
-            }
-        )
-    listed = None if tv else movies
-    for day, items in _week_items(listed, episodes, today, tz).items():
-        if not items:
-            continue  # quiet days are left off rather than saying so
-        label = {0: "Today \N{MIDDLE DOT} ", 1: "Tomorrow \N{MIDDLE DOT} "}.get((day - today).days, "")
-        items.sort()
-        value = _limit_lines([line for _, line in items], MAX_PER_DAY, DAY_LIMIT)
-        fields.append({"name": label + _short_date(day), "value": value, "inline": False})
-    lines = list(problems)
-    if not fields and (listed is not None or episodes is not None):
-        lines.append("No new episodes this week." if tv else "Nothing new is due this week.")
+    """The "coming later" message, as an embed dict without a timestamp: movies out
+    digitally after this week (up to days ahead), then approved Seerr requests
+    that aren't in the library yet. movies is None if Radarr has never answered;
+    requests is None when Seerr isn't set up."""
+    embed: Dict[str, Any] = {
+        "title": "\N{CLAPPER BOARD} Coming later",
+        "color": COLOUR_SOON,
+        "footer": {"text": f"From Radarr{', Seerr' if requests is not None else ''} \N{MIDDLE DOT} movies up to {days} days ahead"},
+    }
+    top = list(problems or [])
+    if movies is None and requests is None:
+        embed["color"] = COLOUR_UNKNOWN
+        embed["description"] = "\n".join(top) or "Waiting for Radarr\N{HORIZONTAL ELLIPSIS}"
+        return embed
+    sections: List[Section] = []
+    later = _movies_by_day(movies, today + timedelta(days=WEEK), today + timedelta(days=days))
+    for day in sorted(later):
+        sections.append((_day_heading(day, today), [_movie_line(m) for m in later[day]]))
     if requests is not None:
-        # A movie Radarr expects out digitally this week says so.
-        due = {
-            m.get("tmdbId"): _release_day(m.get("digitalRelease"))
-            for m in movies or []
-            if m.get("tmdbId")
-        }
-        # Approved requests that aren't in the library yet: the ones with a
-        # digital date first, soonest first, then the rest newest first.
+        # Approved requests not in the library yet: the ones Radarr has a digital
+        # date for first, soonest first, then the rest newest first.
+        due = {m.get("tmdbId"): _release_day(m.get("digitalRelease")) for m in movies or [] if m.get("tmdbId")}
         coming: List[Tuple[Tuple[int, str], str]] = []
         for n, req in enumerate(requests):
             media = _dict(req.get("media"))
@@ -354,22 +333,13 @@ def render_week(
             coming.append((key, _request_line(req, note)))
         coming.sort(key=lambda c: c[0])
         if coming:
-            fields.append(
-                {
-                    "name": f"\N{INBOX TRAY} Requested and on the way ({len(coming)})",
-                    "value": _limit_lines([line for _, line in coming], MAX_REQUESTS, REQUEST_LIMIT),
-                    "inline": False,
-                }
-            )
-    description = "\n".join(lines) if lines else None
-    embed: Dict[str, Any] = {
-        "title": "\N{TELEVISION} New episodes this week" if tv else "\N{SPIRAL CALENDAR PAD} Coming up this week",
-        "color": COLOUR_WEEK if not problems else COLOUR_UNKNOWN,
-        "fields": fields,
-        "footer": {"text": ("From " + ", ".join(sources)) if sources else "No services set up"},
-    }
-    if description:
-        embed["description"] = description
+            sections.append(("\N{INBOX TRAY} Requested and on the way", [line for _, line in coming]))
+    empty = f"No more movies are due out digitally in the next {days} days."
+    embed["description"] = _layout(top, sections, empty)
+    if later:
+        poster = _poster(later[min(later)][0])
+        if poster:
+            embed["thumbnail"] = {"url": poster}
     return embed
 
 
@@ -589,12 +559,13 @@ class Upcoming(commands.Cog):
         added = _added_lines(today_only(movie_history), today_only(episode_history))
         if not radarr_on:
             radarr_problem = "Radarr isn't set up, so there's nothing to list. See `!upcoming show`."
-        soon = render_soon(movies, today, days, radarr_problem)
-        sources = [n for n, on in (("Radarr", radarr_on), ("Sonarr", sonarr_on), ("Seerr", seerr_on)) if on]
-        problems = [p for p in (radarr_problem if radarr_on else None, sonarr_problem, seerr_problem) if p]
-        week = render_week(movies, episodes, requests, today, tz, sources, problems, tv=sonarr_on, added=added)
+        soon = render_soon(movies, requests, today, days, [p for p in (radarr_problem, seerr_problem) if p])
+        sources = [n for n, on in (("Radarr", radarr_on), ("Sonarr", sonarr_on)) if on]
+        problems = [p for p in (radarr_problem if radarr_on else None, sonarr_problem) if p]
+        week = render_week(movies, episodes, added, today, tz, sources, problems)
         week["footer"]["text"] += f" \N{MIDDLE DOT} days in {tz.key}"
-        return {"soon": soon, "week": week}
+        # In this order, so a fresh setup reads this week first, then later.
+        return {"week": week, "soon": soon}
 
     async def _sync(self, force: bool = False) -> None:
         async with self._lock:
@@ -697,13 +668,13 @@ class Upcoming(commands.Cog):
 
     @upcoming.command(name="days")
     async def up_days(self, ctx: commands.Context, days: int) -> None:
-        """How many days ahead "Out digitally soon" looks (7 to 90, default 30)."""
+        """How many days ahead "Coming later" lists movies (7 to 90, default 30)."""
         if not MIN_DAYS <= days <= MAX_DAYS:
             await ctx.send(f"Pick a number from {MIN_DAYS} to {MAX_DAYS}.")
             return
         await self.config.days.set(days)
         await self._sync(force=True)
-        await ctx.send(f"\"Out digitally soon\" now looks {days} days ahead.")
+        await ctx.send(f"\"Coming later\" now lists movies up to {days} days ahead.")
 
     @upcoming.command(name="timezone", aliases=["tz"])
     async def up_timezone(self, ctx: commands.Context, name: str) -> None:
