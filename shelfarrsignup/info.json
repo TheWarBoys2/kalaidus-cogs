@@ -1,0 +1,11 @@
+{
+    "author": ["Jay"],
+    "name": "ShelfarrSignup",
+    "short": "Request a Shelfarr account from Discord, with admin approval.",
+    "description": "Members click a button and pick a username. An admin approves the request in a private channel, the bot creates the account through Shelfarr's API with a random password, and DMs the login to the member. Passwords are never stored.",
+    "install_msg": "Set up with [p]shelfarrsignup channel #approvals and [p]shelfarrsignup loginurl <address>, DM the bot [p]set api shelfarr url <shelfarr url> api_key <token with users:write>, then [p]shelfarrsignup post [#channel].",
+    "requirements": [],
+    "tags": ["shelfarr", "signup", "approval", "homelab"],
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog stores Discord user IDs with the Shelfarr username they asked for, while a request is pending and after an account is created. Passwords are never stored."
+}
