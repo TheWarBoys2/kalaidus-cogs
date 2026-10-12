@@ -58,7 +58,7 @@ None of the cogs ever print a key back. Their `show` commands only say whether o
 | pzadmin | PZAdmin's URL; per Discord server, which channels are linked to which PZAdmin server and which get dots |
 | containerstatus | Default Arcane environment, the cards (channel, message, container, title, description, link), dots and ignored channels |
 | upcoming | The channel, the two message IDs, days ahead and timezone |
-| rolegate | Per Discord server: the approvals channel, the roles on the panel, where the panel is, the sign-up address, and pending requests (user ID, role ID and any requested username, removed once decided) |
+| rolegate | Per Discord server: the approvals channel, the roles on the panel, where the panel is, the sign-up address, pending requests (user ID, role ID and any requested username, removed once decided), and the Audiobookshelf username made for each member who signed up |
 | foundry | OliveTin's URL, the action ID and the timeout |
 
 pzadmin sends a requester's Discord username and ID to PZAdmin with each mod request, and PZAdmin keeps them with the request. No cog stores anything else about users.
