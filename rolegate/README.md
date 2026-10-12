@@ -39,7 +39,8 @@ Prefix only. The bot owner, Red admins (the roles set with `!set roles addadminr
 | `!rolegate signup disable @Role` | Turns that off. Accounts already made are left alone |
 | `!rolegate signup forget <@member or user ID>` | Lets a member sign up again, for example after you delete their Audiobookshelf account |
 | `!rolegate signup link [url]` | The Audiobookshelf address put in the welcome DM. Leave it out to clear it |
-| `!rolegate signup check` | Checks the bot can reach Audiobookshelf and the key is an admin's |
+| `!rolegate signup requestlink [url]` | The Shelfarr address put in the welcome DM. Leave it out to clear it |
+| `!rolegate signup check` | Checks the bot can reach Audiobookshelf, and Shelfarr if it's set up, and that the keys can create accounts |
 
 The panel holds at most 25 roles.
 
@@ -61,13 +62,15 @@ If a role is deleted in Discord, it's taken off the panel list automatically (ru
 
 Turn a role into a sign-up for an [Audiobookshelf](https://www.audiobookshelf.org/) server, so nobody has to make accounts by hand:
 
-1. A member clicks the role. A pop-up asks them to pick a username (3 to 32 letters, numbers, dots, dashes or underscores).
+1. A member clicks the role. A pop-up asks them to pick a username (3 to 32 lowercase letters, numbers or underscores; capitals are lowered for them).
 2. **Open role:** the account is created with a random password straight away, they get the role, and they're DMed the address, username and password, with a reminder to change the password.
 3. **Approval role:** the approval card shows the username they asked for, and **Approve** does the same as above.
 
 Each member gets one account. Once the bot has made one for them, clicking the role again (after removing it) just gives the role back. Use `!rolegate signup forget` if you delete their account and want them to be able to sign up again.
 
-The account is a normal user: it can stream and download from every library, and can't edit, delete or upload anything. Change that per person in Audiobookshelf afterwards if you need to.
+**Shelfarr too (optional).** If [Shelfarr](https://github.com/Pedro-Revez-Silva/shelfarr) is set up as well, the bot also makes a normal Shelfarr user with the same username and password, so the member can request books straight away. If that part fails (say the username is taken in Shelfarr), the Audiobookshelf account still stands, the DM tells them to ask an admin, and the bot logs why. The two passwords are separate after that, so changing one doesn't change the other.
+
+The Audiobookshelf account is a normal user: it can stream and download from every library, and can't edit, delete or upload anything. Change that per person in Audiobookshelf afterwards if you need to.
 
 If the username is already taken, the member is told to click again and pick another (on an approval role the request closes). If Audiobookshelf can't be reached or rejects the key, an open role tells the member to let an admin know and logs why; an approval role tells only the approver why and leaves the request open so Approve can be clicked again. If the member has DMs closed, the login is shown privately instead (to the member on an open role, to the approver on an approval role), so it isn't lost. The password is never stored or shown on a card.
 
@@ -81,16 +84,22 @@ Removing the role (or denying a request) never touches Audiobookshelf accounts. 
    ```
    !set api audiobookshelf url http://<audiobookshelf-host>:<port> api_key <key>
    ```
-3. **Turn it on and check it**, in the server:
+3. **Shelfarr (optional)**: in Shelfarr, open your profile as an admin and create an API token with the `users:write` scope. Then DM the bot:
+
+   ```
+   !set api shelfarr url http://<shelfarr-host>:<port> api_key <token>
+   ```
+4. **Turn it on and check it**, in the server:
 
    ```
    !rolegate add @Audiobooks open Audiobooks
    !rolegate signup enable @Audiobooks
    !rolegate signup link https://<your-audiobookshelf-address>
+   !rolegate signup requestlink https://<your-shelfarr-address>
    !rolegate signup check
    !rolegate refresh
    ```
 
 ## What it stores
 
-Per Discord server: the approvals channel, the roles on the panel (mode, label, description, emoji), where the latest panel is, pending requests as user ID and role ID (plus the requested username for sign-up roles), the sign-up address, and which Audiobookshelf username was made for which member. A pending request is removed once it's approved or denied. Red's "delete my data" removes a user's pending requests.
+Per Discord server: the approvals channel, the roles on the panel (mode, label, description, emoji), where the latest panel is, pending requests as user ID and role ID (plus the requested username for sign-up roles), the Audiobookshelf and Shelfarr addresses, and which Audiobookshelf username was made for which member. A pending request is removed once it's approved or denied. Red's "delete my data" removes a user's pending requests.

@@ -4,7 +4,7 @@ import logging
 import re
 import secrets
 from collections import defaultdict
-from typing import Dict, Literal, Optional, Union
+from typing import Dict, Literal, Optional, Tuple, Union
 
 import aiohttp
 import discord
@@ -33,8 +33,11 @@ DANGEROUS_PERMS = (
 
 # Audiobookshelf sign-up: the key and address live in Red's shared API tokens under this name.
 ABS_SERVICE = "audiobookshelf"
+# Optional: also make a Shelfarr account (for book requests) with the same login.
+SHELFARR_SERVICE = "shelfarr"
 ABS_TIMEOUT = 15
-USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,32}$")
+# Shelfarr only allows lowercase letters, numbers and underscores, so both accounts follow that.
+USERNAME_RE = re.compile(r"^[a-z0-9_]{3,32}$")
 # No 0/O, 1/l/I, so the password is easy to type from a DM.
 PASSWORD_ALPHABET = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 PASSWORD_LENGTH = 14
@@ -133,7 +136,7 @@ class UsernameModal(discord.ui.Modal, title="Audiobookshelf sign-up"):
 
     username = discord.ui.TextInput(
         label="Pick a username",
-        placeholder="Letters, numbers, dots, dashes or underscores",
+        placeholder="Lowercase letters, numbers or underscores",
         min_length=3,
         max_length=32,
     )
@@ -172,6 +175,7 @@ class RoleGate(commands.Cog):
             panel={},  # {"channel_id": int, "message_id": int, "title": str}
             pending={},  # "<user_id>:<role_id>": {"channel_id", "message_id", "username" (sign-up roles only)}
             signup_link=None,  # address members use to reach Audiobookshelf, sent in the welcome DM
+            signup_request_link=None,  # address members use to reach Shelfarr, sent in the welcome DM
             signups={},  # "<user_id>": Audiobookshelf username made for them, so each member gets one account
         )
         self._locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -331,10 +335,10 @@ class RoleGate(commands.Cog):
         if guild is None or not isinstance(member, discord.Member):
             await interaction.response.send_message("This only works in a server.", ephemeral=True)
             return
-        username = username.strip()
+        username = username.strip().lower()
         if not USERNAME_RE.match(username):
             await interaction.response.send_message(
-                "Usernames need 3 to 32 letters, numbers, dots, dashes or underscores, with no spaces. "
+                "Usernames need 3 to 32 letters, numbers or underscores, with no spaces. "
                 "Click the button again to try another.",
                 ephemeral=True,
             )
@@ -363,7 +367,7 @@ class RoleGate(commands.Cog):
                 await send("You already have an Audiobookshelf account. Click the button again to get the role.", ephemeral=True)
                 return
             try:
-                password = await self._abs_create_user(username)
+                password, shelfarr = await self._create_accounts(username, member.display_name)
             except AbsUsernameTaken:
                 await send(
                     f"The username **{username}** is already taken. Click the button again to pick another.",
@@ -382,7 +386,7 @@ class RoleGate(commands.Cog):
         except discord.HTTPException:
             log.exception("Failed adding role %s to %s after sign-up", role.id, member.id)
             note = "Your account is ready, but I couldn't give you the role. Please let an admin know."
-        welcome = await self._welcome_text(guild, username, password)
+        welcome = await self._welcome_text(guild, username, password, shelfarr)
         try:
             await member.send(f"{note}\n\n{welcome}")
         except discord.HTTPException:
@@ -480,7 +484,7 @@ class RoleGate(commands.Cog):
 
             granted = False
             taken = False
-            account = None  # (username, password) once an Audiobookshelf account exists
+            account = None  # (username, password, shelfarr result) once an Audiobookshelf account exists
             entry = (await conf.roles()).get(str(role_id)) or {}
             if member is None:
                 outcome = "Member has left the server."
@@ -501,7 +505,7 @@ class RoleGate(commands.Cog):
                 username = info.get("username")
                 if entry.get("signup") and username:
                     try:
-                        account = (username, await self._abs_create_user(username))
+                        account = (username, *await self._create_accounts(username, member.display_name))
                         await self._record_signup(guild, user_id, username)
                     except AbsUsernameTaken:
                         taken = True
@@ -643,18 +647,69 @@ class RoleGate(commands.Cog):
         log.info("Created Audiobookshelf user %s", username)
         return password
 
-    async def _welcome_text(self, guild: discord.Guild, username: str, password: str) -> str:
-        link = await self.config.guild(guild).signup_link()
+    async def _shelfarr_request(self, json: dict) -> Optional[aiohttp.ClientResponse]:
+        """POST to Shelfarr's user API. Returns None if Shelfarr isn't set up."""
+        tokens = await self.bot.get_shared_api_tokens(SHELFARR_SERVICE)
+        base, key = (tokens.get("url") or "").strip().rstrip("/"), (tokens.get("api_key") or "").strip()
+        if not base or not key:
+            return None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    base + "/api/v1/users",
+                    json=json,
+                    headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=ABS_TIMEOUT),
+                ) as resp:
+                    await resp.read()
+                    return resp
+        except asyncio.TimeoutError:
+            raise AbsError(f"Shelfarr didn't answer within {ABS_TIMEOUT} seconds.") from None
+        except aiohttp.ClientError as e:
+            log.warning("Shelfarr unreachable: %s", e)
+            raise AbsError("Couldn't reach Shelfarr. Check the URL and that it's running.") from None
+
+    async def _create_accounts(self, username: str, name: str) -> Tuple[str, Optional[bool]]:
+        """Make the Audiobookshelf account, then the Shelfarr one if Shelfarr is set up.
+
+        Returns the password and whether the Shelfarr account was made (None if Shelfarr isn't set up).
+        A Shelfarr failure doesn't undo the Audiobookshelf account; it's logged and mentioned in the DM.
+        """
+        password = await self._abs_create_user(username)
+        try:
+            resp = await self._shelfarr_request({"name": name[:100] or username, "username": username, "password": password})
+        except AbsError as e:
+            log.warning("Shelfarr account for %s not made: %s", username, e)
+            return password, False
+        if resp is None:
+            return password, None
+        if resp.status in (200, 201):
+            log.info("Created Shelfarr user %s", username)
+            return password, True
+        log.warning("Shelfarr account for %s not made: HTTP %s %s", username, resp.status, (await resp.text())[:200])
+        return password, False
+
+    async def _welcome_text(
+        self, guild: discord.Guild, username: str, password: str, shelfarr: Optional[bool] = None
+    ) -> str:
+        conf = self.config.guild(guild)
+        link = await conf.signup_link()
         lines = ["**Your Audiobookshelf login**"]
         if link:
             lines.append(f"Address: <{link}>")
-        lines += [
-            f"Username: `{username}`",
-            f"Password: `{password}`",
-            "",
+        lines += [f"Username: `{username}`", f"Password: `{password}`", ""]
+        if shelfarr:
+            request_link = await conf.signup_request_link()
+            where = f" at <{request_link}>" if request_link else ""
+            lines += ["The same username and password work for requesting books on Shelfarr" + where + ".", ""]
+        elif shelfarr is False:
+            lines += ["I couldn't make your Shelfarr login for requesting books. Please ask an admin.", ""]
+        lines.append(
             "Please change your password after you first log in: open your account from the "
-            "person icon at the top right and use Change Password.",
-        ]
+            "person icon at the top right and use Change Password."
+        )
+        if shelfarr:
+            lines.append("Changing it in one doesn't change the other.")
         return "\n".join(lines)
 
     # ---------- housekeeping ----------
@@ -802,6 +857,7 @@ class RoleGate(commands.Cog):
         lines = [f"Approvals channel: {channel.mention if channel else 'not set'}"]
         if any(e.get("signup") for e in data["roles"].values()):
             lines.append(f"Sign-up address in the welcome DM: {data['signup_link'] or 'not set'}")
+            lines.append(f"Shelfarr address in the welcome DM: {data['signup_request_link'] or 'not set'}")
         lines.append("")
         for role_id, entry in data["roles"].items():
             role = ctx.guild.get_role(int(role_id))
@@ -926,16 +982,48 @@ class RoleGate(commands.Cog):
         await self.config.guild(ctx.guild).signup_link.set(url or None)
         await ctx.send(f"Welcome DMs will link to <{url}>." if url else "Welcome DMs won't include an address.")
 
+    @rolegate_signup.command(name="requestlink")
+    async def rolegate_signup_requestlink(self, ctx: commands.Context, url: Optional[str] = None) -> None:
+        """Set the Shelfarr address sent in the welcome DM. Leave it out to clear it."""
+        if url and not url.lower().startswith(("http://", "https://")):
+            await ctx.send("Give the full address, starting with http:// or https://.")
+            return
+        await self.config.guild(ctx.guild).signup_request_link.set(url or None)
+        await ctx.send(f"Welcome DMs will link to <{url}> for requests." if url else "Welcome DMs won't include a Shelfarr address.")
+
     @rolegate_signup.command(name="check")
     async def rolegate_signup_check(self, ctx: commands.Context) -> None:
-        """Check the bot can reach Audiobookshelf with an admin key."""
+        """Check the bot can reach Audiobookshelf (and Shelfarr, if set up) with admin keys."""
+        lines = []
         async with ctx.typing():
             try:
                 await self._abs_check_status(await self._abs_request("GET", "/api/users"))
+                lines.append("\N{WHITE HEAVY CHECK MARK} Audiobookshelf is reachable and the key can create accounts.")
             except AbsError as e:
-                await ctx.send(f"\N{CROSS MARK} {e}")
-                return
-        await ctx.send("\N{WHITE HEAVY CHECK MARK} Audiobookshelf is reachable and the key can create accounts.")
+                lines.append(f"\N{CROSS MARK} {e}")
+            try:
+                # An empty user is rejected with 422 only after the key and its scope pass, so nothing is created.
+                resp = await self._shelfarr_request({})
+            except AbsError as e:
+                lines.append(f"\N{CROSS MARK} {e}")
+            else:
+                if resp is None:
+                    lines.append(
+                        "Shelfarr isn't set up, so only Audiobookshelf accounts are made. To add it, DM me: "
+                        f"`{ctx.clean_prefix}set api {SHELFARR_SERVICE} url <url> api_key <key>`."
+                    )
+                elif resp.status == 422:
+                    lines.append("\N{WHITE HEAVY CHECK MARK} Shelfarr is reachable and the key can create accounts.")
+                elif resp.status == 401:
+                    lines.append("\N{CROSS MARK} Shelfarr rejected the API key.")
+                elif resp.status == 403:
+                    lines.append(
+                        "\N{CROSS MARK} Shelfarr's key can't create users. Make it from an admin account "
+                        "with the `users:write` scope."
+                    )
+                else:
+                    lines.append(f"\N{CROSS MARK} Shelfarr returned HTTP {resp.status}. Is the URL Shelfarr's, with no path?")
+        await ctx.send("\n".join(lines))
 
     @rolegate.command(name="pending")
     async def rolegate_pending(self, ctx: commands.Context) -> None:
