@@ -9,7 +9,7 @@ Commands below use `!` as the prefix. Swap in your own if it's different.
 | [pzadmin](pzadmin/README.md) | Project Zomboid server status, player lists, restarts, mod requests and status dots in channel names | [PZAdmin](https://github.com/TheWarBoys2/pzadmin)'s `/api/v1` | Anyone for status and requests; restarts need you to lock them down (see its README); settings are owner only |
 | [containerstatus](containerstatus/README.md) | Live status cards and channel-name dots for any Docker container | Arcane's API (read only) | Bot owner only |
 | [upcoming](upcoming/README.md) | Two live messages: this week (added today, then each day), and movies and requests coming later | Radarr, and optionally Sonarr and Seerr (read only) | Bot owner sets it up; everyone in the channel reads it |
-| [rolegate](rolegate/README.md) | A button panel for self-service roles, with moderator approval for some | Discord only | Admins or anyone with Manage Roles set it up; members click buttons |
+| [rolegate](rolegate/README.md) | A button panel for self-service roles, with moderator approval for some, and optional Audiobookshelf sign-up | Discord, and optionally Audiobookshelf (creates users) | Admins or anyone with Manage Roles set it up; members click buttons |
 | [foundry](foundry/README.md) | Runs a Foundry VTT maintenance action (fix file permissions) | [OliveTin](https://www.olivetin.app/) | Anyone who can run the command (see its README) |
 
 ## Installing
@@ -41,6 +41,7 @@ Where a cog needs a key, it lives in Red's shared API tokens, not in the cog's o
 | containerstatus | `!set api arcane url <arcane url> api_key <key>` |
 | upcoming | `!set api radarr url <url> api_key <key>`, and the same for `sonarr` and `seerr` |
 | foundry | `!set api olivetin api_key <key>` (the URL is set separately with `!foundryset url`) |
+| rolegate (only for Audiobookshelf sign-up) | `!set api audiobookshelf url <url> api_key <key>` (an admin's key) |
 
 None of the cogs ever print a key back. Their `show` commands only say whether one is set.
 
@@ -57,7 +58,7 @@ None of the cogs ever print a key back. Their `show` commands only say whether o
 | pzadmin | PZAdmin's URL; per Discord server, which channels are linked to which PZAdmin server and which get dots |
 | containerstatus | Default Arcane environment, the cards (channel, message, container, title, description, link), dots and ignored channels |
 | upcoming | The channel, the two message IDs, days ahead and timezone |
-| rolegate | Per Discord server: the approvals channel, the roles on the panel, where the panel is, and pending requests (user ID and role ID, removed once decided) |
+| rolegate | Per Discord server: the approvals channel, the roles on the panel, where the panel is, the sign-up address, and pending requests (user ID, role ID and any requested username, removed once decided) |
 | foundry | OliveTin's URL, the action ID and the timeout |
 
 pzadmin sends a requester's Discord username and ID to PZAdmin with each mod request, and PZAdmin keeps them with the request. No cog stores anything else about users.

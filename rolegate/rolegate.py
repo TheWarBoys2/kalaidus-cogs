@@ -1,9 +1,12 @@
 import asyncio
 import contextlib
 import logging
+import re
+import secrets
 from collections import defaultdict
 from typing import Dict, Literal, Optional, Union
 
+import aiohttp
 import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
@@ -27,6 +30,22 @@ DANGEROUS_PERMS = (
     "manage_messages",
     "mention_everyone",
 )
+
+# Audiobookshelf sign-up: the key and address live in Red's shared API tokens under this name.
+ABS_SERVICE = "audiobookshelf"
+ABS_TIMEOUT = 15
+USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,32}$")
+# No 0/O, 1/l/I, so the password is easy to type from a DM.
+PASSWORD_ALPHABET = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+PASSWORD_LENGTH = 14
+
+
+class AbsError(Exception):
+    """Audiobookshelf couldn't create the account. The message is safe to show the approver."""
+
+
+class AbsUsernameTaken(AbsError):
+    pass
 
 
 def _pending_key(user_id: int, role_id: int) -> str:
@@ -109,6 +128,28 @@ class DecisionButton(
         await cog.handle_decision(interaction, self.action, self.user_id, self.role_id)
 
 
+class UsernameModal(discord.ui.Modal, title="Audiobookshelf sign-up"):
+    """Asks for the username to create when a sign-up role is approved."""
+
+    username = discord.ui.TextInput(
+        label="Pick a username",
+        placeholder="Letters, numbers, dots, dashes or underscores",
+        min_length=3,
+        max_length=32,
+    )
+
+    def __init__(self, role_id: int) -> None:
+        super().__init__(timeout=600)
+        self.role_id = role_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        cog = interaction.client.get_cog("RoleGate")
+        if cog is None:
+            await _cog_unavailable(interaction)
+            return
+        await cog.handle_signup_submit(interaction, self.role_id, self.username.value)
+
+
 async def _cog_unavailable(interaction: discord.Interaction) -> None:
     with contextlib.suppress(discord.HTTPException):
         await interaction.response.send_message(
@@ -129,7 +170,8 @@ class RoleGate(commands.Cog):
             approval_channel=None,
             roles={},  # "<role_id>": {"mode", "label", "description", "emoji"}
             panel={},  # {"channel_id": int, "message_id": int, "title": str}
-            pending={},  # "<user_id>:<role_id>": {"channel_id": int, "message_id": int}
+            pending={},  # "<user_id>:<role_id>": {"channel_id", "message_id", "username" (sign-up roles only)}
+            signup_link=None,  # address members use to reach Audiobookshelf, sent in the welcome DM
         )
         self._locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -222,11 +264,30 @@ class RoleGate(commands.Cog):
             await interaction.response.send_message("You can't use this here.", ephemeral=True)
             return
 
+        conf = self.config.guild(guild)
+        entry = (await conf.roles()).get(str(role_id))
+        role = guild.get_role(role_id)
+
+        # Sign-up roles ask for a username first. A modal has to be the first response, so no defer yet.
+        if (
+            entry is not None
+            and role is not None
+            and entry.get("signup")
+            and entry["mode"] == "approval"
+            and role not in member.roles
+            and self._role_problem(guild, role) is None
+        ):
+            if _pending_key(member.id, role.id) in await conf.pending():
+                await interaction.response.send_message(
+                    f"Your request for **{role.name}** is still waiting for a moderator.", ephemeral=True
+                )
+                return
+            await interaction.response.send_modal(UsernameModal(role.id))
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
         send = interaction.followup.send
 
-        entry = (await self.config.guild(guild).roles()).get(str(role_id))
-        role = guild.get_role(role_id)
         if entry is None or role is None:
             await send("That role isn't offered any more.", ephemeral=True)
             return
@@ -259,7 +320,39 @@ class RoleGate(commands.Cog):
 
         await send(await self._create_request(guild, member, role), ephemeral=True)
 
-    async def _create_request(self, guild: discord.Guild, member: discord.Member, role: discord.Role) -> str:
+    async def handle_signup_submit(self, interaction: discord.Interaction, role_id: int, username: str) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+        username = username.strip()
+        if not USERNAME_RE.match(username):
+            await interaction.response.send_message(
+                "Usernames need 3 to 32 letters, numbers, dots, dashes or underscores, with no spaces. "
+                "Click the button again to try another.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        send = interaction.followup.send
+        entry = (await self.config.guild(guild).roles()).get(str(role_id))
+        role = guild.get_role(role_id)
+        if entry is None or role is None:
+            await send("That role isn't offered any more.", ephemeral=True)
+            return
+        if role in member.roles:
+            await send(f"You already have **{role.name}**.", ephemeral=True)
+            return
+        if self._role_problem(guild, role):
+            await send("I can't manage that role right now. Please let an admin know.", ephemeral=True)
+            return
+        await send(await self._create_request(guild, member, role, username), ephemeral=True)
+
+    async def _create_request(
+        self, guild: discord.Guild, member: discord.Member, role: discord.Role, username: Optional[str] = None
+    ) -> str:
         conf = self.config.guild(guild)
         key = _pending_key(member.id, role.id)
         async with self._locks[guild.id]:
@@ -284,6 +377,8 @@ class RoleGate(commands.Cog):
                 name="Joined server",
                 value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "Unknown",
             )
+            if username:
+                embed.add_field(name="Audiobookshelf username", value=f"`{username}`", inline=False)
             embed.set_thumbnail(url=member.display_avatar.url)
 
             view = discord.ui.View(timeout=None)
@@ -298,6 +393,8 @@ class RoleGate(commands.Cog):
 
             async with conf.pending() as pending:
                 pending[key] = {"channel_id": channel.id, "message_id": message.id}
+                if username:
+                    pending[key]["username"] = username
 
         log.info("%s (%s) requested role %s in guild %s", member, member.id, role.id, guild.id)
         return f"Request for **{role.name}** sent. You'll get a DM when a moderator decides."
@@ -322,7 +419,8 @@ class RoleGate(commands.Cog):
         approver = interaction.user
 
         async with self._locks[guild.id]:
-            if key not in await conf.pending():
+            info = (await conf.pending()).get(key)
+            if info is None:
                 await interaction.followup.send("This request has already been handled.", ephemeral=True)
                 with contextlib.suppress(discord.HTTPException):
                     await interaction.edit_original_response(view=None)
@@ -336,6 +434,9 @@ class RoleGate(commands.Cog):
             role_name = role.name if role else f"role {role_id}"
 
             granted = False
+            taken = False
+            account = None  # (username, password) once an Audiobookshelf account exists
+            entry = (await conf.roles()).get(str(role_id)) or {}
             if member is None:
                 outcome = "Member has left the server."
                 colour = discord.Colour.dark_grey()
@@ -345,23 +446,43 @@ class RoleGate(commands.Cog):
             elif role is None:
                 outcome = "Not granted: the role no longer exists."
                 colour = discord.Colour.dark_grey()
-            elif str(role_id) not in await conf.roles():
+            elif not entry:
                 outcome = "Not granted: that role is no longer offered by RoleGate."
                 colour = discord.Colour.dark_grey()
             elif problem := self._role_problem(guild, role):
                 outcome = f"Not granted: I can't manage that role, {problem}"
                 colour = discord.Colour.dark_grey()
             else:
-                try:
-                    await member.add_roles(role, reason=f"RoleGate: approved by {approver} ({approver.id})")
-                except discord.HTTPException as e:
-                    log.exception("Failed granting role %s to %s", role_id, user_id)
-                    outcome = f"Not granted: Discord refused the role change ({e.status})."
-                    colour = discord.Colour.dark_grey()
-                else:
-                    granted = True
-                    outcome = f"Approved by {approver.mention}"
-                    colour = discord.Colour.green()
+                username = info.get("username")
+                if entry.get("signup") and username:
+                    try:
+                        account = (username, await self._abs_create_user(username))
+                    except AbsUsernameTaken:
+                        taken = True
+                        outcome = f"Not granted: the Audiobookshelf username `{username}` is already taken."
+                        colour = discord.Colour.dark_grey()
+                    except AbsError as e:
+                        # Leave the request open so the approver can fix the problem and click Approve again.
+                        log.warning("Audiobookshelf sign-up for %s failed: %s", user_id, e)
+                        await interaction.followup.send(
+                            f"I couldn't create the Audiobookshelf account: {e}\n"
+                            "The request is still open, so you can click Approve again once that's fixed.",
+                            ephemeral=True,
+                        )
+                        return
+                if not taken:
+                    try:
+                        await member.add_roles(role, reason=f"RoleGate: approved by {approver} ({approver.id})")
+                    except discord.HTTPException as e:
+                        log.exception("Failed granting role %s to %s", role_id, user_id)
+                        outcome = f"Not granted: Discord refused the role change ({e.status})."
+                        colour = discord.Colour.dark_grey()
+                    else:
+                        granted = True
+                        outcome = f"Approved by {approver.mention}"
+                        colour = discord.Colour.green()
+                    if account:
+                        outcome += f"\nAudiobookshelf account `{account[0]}` created."
 
             if action == "deny" and member is None:
                 outcome = f"Denied by {approver.mention} (member has left the server)"
@@ -387,6 +508,11 @@ class RoleGate(commands.Cog):
             return
         if granted:
             dm = f"Your request for **{role_name}** in **{guild.name}** was approved."
+        elif taken:
+            dm = (
+                f"The Audiobookshelf username **{info['username']}** is already taken, so your request for "
+                f"**{role_name}** in **{guild.name}** was closed. Click the button again to pick another."
+            )
         elif action == "deny":
             dm = f"Your request for **{role_name}** in **{guild.name}** was denied."
         else:
@@ -394,8 +520,96 @@ class RoleGate(commands.Cog):
                 f"Your request for **{role_name}** in **{guild.name}** couldn't be completed. "
                 "Please ask a moderator."
             )
-        with contextlib.suppress(discord.HTTPException):
+        if account:
+            dm += "\n\n" + await self._welcome_text(guild, *account)
+        try:
             await member.send(dm)
+        except discord.HTTPException:
+            if account:
+                # The password only exists in this DM, so hand it to the approver instead of losing it.
+                with contextlib.suppress(discord.HTTPException):
+                    await interaction.followup.send(
+                        f"I couldn't DM {member.mention} (their DMs are probably closed). "
+                        f"Pass these on yourself:\n\n{await self._welcome_text(guild, *account)}",
+                        ephemeral=True,
+                        allowed_mentions=NO_MENTIONS,
+                    )
+
+    # ---------- Audiobookshelf ----------
+
+    async def _abs_request(self, method: str, path: str, json: Optional[dict] = None) -> aiohttp.ClientResponse:
+        tokens = await self.bot.get_shared_api_tokens(ABS_SERVICE)
+        base, key = (tokens.get("url") or "").strip().rstrip("/"), (tokens.get("api_key") or "").strip()
+        if not base or not key:
+            raise AbsError(
+                f"Audiobookshelf isn't set up. DM the bot: `!set api {ABS_SERVICE} url <url> api_key <key>`."
+            )
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.request(
+                    method,
+                    base + path,
+                    json=json,
+                    headers={"Authorization": f"Bearer {key}"},
+                    timeout=aiohttp.ClientTimeout(total=ABS_TIMEOUT),
+                ) as resp:
+                    await resp.read()
+                    return resp
+        except asyncio.TimeoutError:
+            raise AbsError(f"Audiobookshelf didn't answer within {ABS_TIMEOUT} seconds.") from None
+        except aiohttp.ClientError as e:
+            log.warning("Audiobookshelf unreachable: %s", e)
+            raise AbsError("Couldn't reach Audiobookshelf. Check the URL and that it's running.") from None
+
+    @staticmethod
+    async def _abs_check_status(resp: aiohttp.ClientResponse) -> None:
+        if resp.status in (401, 403):
+            raise AbsError("Audiobookshelf rejected the API key. It has to belong to an admin account.")
+        if resp.status == 404:
+            raise AbsError("Audiobookshelf returned 404. Is the URL the Audiobookshelf address, with no path?")
+        if resp.status >= 400:
+            text = (await resp.text())[:200]
+            raise AbsError(f"Audiobookshelf returned HTTP {resp.status}: {text}")
+
+    async def _abs_create_user(self, username: str) -> str:
+        """Create a normal Audiobookshelf user and return its password."""
+        password = "".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(PASSWORD_LENGTH))
+        body = {
+            "username": username,
+            "password": password,
+            "type": "user",
+            "isActive": True,  # Audiobookshelf creates the account disabled unless this is set
+            "permissions": {
+                "download": True,
+                "update": False,
+                "delete": False,
+                "upload": False,
+                "createEreader": False,
+                "accessAllLibraries": True,
+                "accessAllTags": True,
+                "accessExplicitContent": True,
+            },
+        }
+        resp = await self._abs_request("POST", "/api/users", body)
+        if resp.status == 400 and "taken" in (await resp.text()).lower():
+            raise AbsUsernameTaken(username)
+        await self._abs_check_status(resp)
+        log.info("Created Audiobookshelf user %s", username)
+        return password
+
+    async def _welcome_text(self, guild: discord.Guild, username: str, password: str) -> str:
+        link = await self.config.guild(guild).signup_link()
+        lines = ["**Your Audiobookshelf login**"]
+        if link:
+            lines.append(f"Address: <{link}>")
+        lines += [
+            f"Username: `{username}`",
+            f"Password: `{password}`",
+            "",
+            "Please change your password after you first log in: open your account from the "
+            "person icon at the top right and use Change Password.",
+        ]
+        return "\n".join(lines)
 
     # ---------- housekeeping ----------
 
@@ -539,13 +753,17 @@ class RoleGate(commands.Cog):
         """Show configured roles and the approvals channel."""
         data = await self.config.guild(ctx.guild).all()
         channel = ctx.guild.get_channel(data["approval_channel"]) if data["approval_channel"] else None
-        lines = [f"Approvals channel: {channel.mention if channel else 'not set'}", ""]
+        lines = [f"Approvals channel: {channel.mention if channel else 'not set'}"]
+        if any(e.get("signup") for e in data["roles"].values()):
+            lines.append(f"Sign-up address in the welcome DM: {data['signup_link'] or 'not set'}")
+        lines.append("")
         for role_id, entry in data["roles"].items():
             role = ctx.guild.get_role(int(role_id))
             where = role.mention if role else f"deleted role `{role_id}`"
             lock = LOCK_EMOJI + " " if entry["mode"] == "approval" else ""
             emoji = entry["emoji"] + " " if entry.get("emoji") else ""
-            lines.append(f"{lock}{emoji}**{entry['label']}**: {where} (`{entry['mode']}`)")
+            signup = " \N{BOOKS} Audiobookshelf sign-up" if entry.get("signup") else ""
+            lines.append(f"{lock}{emoji}**{entry['label']}**: {where} (`{entry['mode']}`){signup}")
             if entry.get("description"):
                 lines.append(f"> {entry['description']}")
         if not data["roles"]:
@@ -598,6 +816,68 @@ class RoleGate(commands.Cog):
             await ctx.send(f"I couldn't update the panel: {e.text or e.status}")
             return
         await ctx.send(f"Panel updated: {message.jump_url}")
+
+    @rolegate.group(name="signup")
+    async def rolegate_signup(self, ctx: commands.Context) -> None:
+        """Create an Audiobookshelf account when a role is approved.
+
+        The member picks a username when they click the role, and gets their login by DM once it's approved.
+        """
+
+    @rolegate_signup.command(name="enable")
+    async def rolegate_signup_enable(self, ctx: commands.Context, role: discord.Role) -> None:
+        """Ask for a username on this role and create the account on approval."""
+        async with self.config.guild(ctx.guild).roles() as roles:
+            entry = roles.get(str(role.id))
+            if entry is None:
+                await ctx.send(f"That role isn't on the panel. Add it first with `{ctx.clean_prefix}rolegate add`.")
+                return
+            switched = entry["mode"] != "approval"
+            entry["mode"] = "approval"
+            entry["signup"] = True
+        msg = f"Clicking **{entry['label']}** now asks for an Audiobookshelf username, and approving it creates the account."
+        if switched:
+            msg += (
+                " I switched it to `approval`, because accounts are only made when you approve. "
+                f"Run `{ctx.clean_prefix}rolegate refresh` to update the posted panel."
+            )
+        tokens = await self.bot.get_shared_api_tokens(ABS_SERVICE)
+        if not tokens.get("url") or not tokens.get("api_key"):
+            msg += f"\n\N{WARNING SIGN} Audiobookshelf isn't set up yet. DM me: `{ctx.clean_prefix}set api {ABS_SERVICE} url <url> api_key <key>`."
+        if not await self.config.guild(ctx.guild).signup_link():
+            msg += f"\nSet the address members use with `{ctx.clean_prefix}rolegate signup link <url>` so it goes in their DM."
+        await ctx.send(msg)
+
+    @rolegate_signup.command(name="disable")
+    async def rolegate_signup_disable(self, ctx: commands.Context, role: discord.Role) -> None:
+        """Stop asking for a username on this role. Existing accounts are left alone."""
+        async with self.config.guild(ctx.guild).roles() as roles:
+            entry = roles.get(str(role.id))
+            if entry is None or not entry.get("signup"):
+                await ctx.send("That role doesn't have sign-up turned on.")
+                return
+            entry.pop("signup", None)
+        await ctx.send(f"**{entry['label']}** is a normal approval role again.")
+
+    @rolegate_signup.command(name="link")
+    async def rolegate_signup_link(self, ctx: commands.Context, url: Optional[str] = None) -> None:
+        """Set the Audiobookshelf address sent in the welcome DM. Leave it out to clear it."""
+        if url and not url.lower().startswith(("http://", "https://")):
+            await ctx.send("Give the full address, starting with http:// or https://.")
+            return
+        await self.config.guild(ctx.guild).signup_link.set(url or None)
+        await ctx.send(f"Welcome DMs will link to <{url}>." if url else "Welcome DMs won't include an address.")
+
+    @rolegate_signup.command(name="check")
+    async def rolegate_signup_check(self, ctx: commands.Context) -> None:
+        """Check the bot can reach Audiobookshelf with an admin key."""
+        async with ctx.typing():
+            try:
+                await self._abs_check_status(await self._abs_request("GET", "/api/users"))
+            except AbsError as e:
+                await ctx.send(f"\N{CROSS MARK} {e}")
+                return
+        await ctx.send("\N{WHITE HEAVY CHECK MARK} Audiobookshelf is reachable and the key can create accounts.")
 
     @rolegate.command(name="pending")
     async def rolegate_pending(self, ctx: commands.Context) -> None:
