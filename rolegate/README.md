@@ -84,7 +84,7 @@ Removing the role (or denying a request) never touches Audiobookshelf accounts. 
    ```
    !set api audiobookshelf url http://<audiobookshelf-host>:<port> api_key <key>
    ```
-3. **Shelfarr (optional)**: in Shelfarr, open your profile as an admin and create an API token with the `users:write` scope. Then DM the bot:
+3. **Shelfarr (optional)**: copy the API token under Admin, Settings, Security in Shelfarr. It has full access, so only ever give it to the bot in a DM. (Profile API tokens can carry the `users:write` scope for admins, but the profile page doesn't offer it as a tick box.) Then DM the bot:
 
    ```
    !set api shelfarr url http://<shelfarr-host>:<port> api_key <token>

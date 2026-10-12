@@ -1018,8 +1018,8 @@ class RoleGate(commands.Cog):
                     lines.append("\N{CROSS MARK} Shelfarr rejected the API key.")
                 elif resp.status == 403:
                     lines.append(
-                        "\N{CROSS MARK} Shelfarr's key can't create users. Make it from an admin account "
-                        "with the `users:write` scope."
+                        "\N{CROSS MARK} Shelfarr's key can't create users. Use the API token from Shelfarr's "
+                        "Admin, Settings, Security instead."
                     )
                 else:
                     lines.append(f"\N{CROSS MARK} Shelfarr returned HTTP {resp.status}. Is the URL Shelfarr's, with no path?")
