@@ -41,7 +41,7 @@ Where a cog needs a key, it lives in Red's shared API tokens, not in the cog's o
 | containerstatus | `!set api arcane url <arcane url> api_key <key>` |
 | upcoming | `!set api radarr url <url> api_key <key>`, and the same for `sonarr` and `seerr` |
 | foundry | `!set api olivetin api_key <key>` (the URL is set separately with `!foundryset url`) |
-| rolegate (only for Audiobookshelf sign-up) | `!set api audiobookshelf url <url> api_key <key>` (an admin's key), and optionally `!set api shelfarr url <url> api_key <token>` (an admin's token with `users:write`) |
+| rolegate (only for Audiobookshelf sign-up) | `!set api audiobookshelf url <url> api_key <key>` (an admin's key), and optionally `!set api shelfarr url <url> api_key <token>` (the API token from Shelfarr's Admin, Settings, Security) |
 
 None of the cogs ever print a key back. Their `show` commands only say whether one is set.
 
