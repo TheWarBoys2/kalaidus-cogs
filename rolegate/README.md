@@ -2,7 +2,7 @@
 
 A button panel where members pick their own roles. **Open** roles are handed out straight away. **Approval** roles (marked 🔒) post a request card to a private channel, where a moderator approves or denies it, and the member gets a DM with the result. Members can always remove a role they have by clicking its button again.
 
-It only uses Discord, unless you turn on [Audiobookshelf sign-up](#audiobookshelf-sign-up) for a role. Buttons keep working after the bot restarts.
+It only uses Discord, unless you turn on [Audiobookshelf sign-up](#audiobookshelf-sign-up) or [Jellyfin sign-up](#jellyfin-sign-up) for a role. Buttons keep working after the bot restarts.
 
 ## Setup
 
@@ -35,12 +35,13 @@ Prefix only. The bot owner, Red admins (the roles set with `!set roles addadminr
 | `!rolegate post [#channel] [title]` | Posts the panel. Posting again makes a new panel; the cog only remembers the latest one for `refresh` |
 | `!rolegate refresh` | Updates the posted panel to match the current roles |
 | `!rolegate pending` | Lists requests still waiting, with links to their cards |
-| `!rolegate signup enable @Role` | Asks for an Audiobookshelf username when someone clicks this role and creates the account: straight away on an `open` role, or once approved on an `approval` role. See [Audiobookshelf sign-up](#audiobookshelf-sign-up) |
+| `!rolegate signup enable @Role [audiobookshelf\|jellyfin]` | Asks for a username when someone clicks this role and creates the account on Audiobookshelf (the default) or Jellyfin: straight away on an `open` role, or once approved on an `approval` role. See [Audiobookshelf sign-up](#audiobookshelf-sign-up) and [Jellyfin sign-up](#jellyfin-sign-up) |
 | `!rolegate signup disable @Role` | Turns that off. Accounts already made are left alone |
-| `!rolegate signup forget <@member or user ID>` | Lets a member sign up again, for example after you delete their Audiobookshelf account |
+| `!rolegate signup forget <@member or user ID> [audiobookshelf\|jellyfin]` | Lets a member sign up again, for example after you delete their account. Defaults to Audiobookshelf |
 | `!rolegate signup link [url]` | The Audiobookshelf address put in the welcome DM. Leave it out to clear it |
+| `!rolegate signup jellyfinlink [url]` | The Jellyfin address put in the Jellyfin welcome DM. Leave it out to clear it |
 | `!rolegate signup requestlink [url]` | The Shelfarr address put in the welcome DM. Leave it out to clear it |
-| `!rolegate signup check` | Checks the bot can reach Audiobookshelf, and Shelfarr if it's set up, and that the keys can create accounts |
+| `!rolegate signup check` | Checks the bot can reach each service a role signs up to (Audiobookshelf and Shelfarr, Jellyfin), and that the keys can create accounts |
 
 The panel holds at most 25 roles.
 
@@ -100,6 +101,32 @@ Removing the role (or denying a request) never touches Audiobookshelf accounts. 
    !rolegate refresh
    ```
 
+## Jellyfin sign-up
+
+Works the same way as [Audiobookshelf sign-up](#audiobookshelf-sign-up), but makes a [Jellyfin](https://jellyfin.org/) account instead. The member picks a username, the account is made with a random password (straight away on an open role, or on Approve), and they're DMed the address, username and password, with a pointer to the Jellyfin apps and a reminder to change the password.
+
+The account gets Jellyfin's defaults for a new user: not an administrator, and access to every library. Change that per person in Jellyfin under Dashboard, Users, if you need to. Shelfarr isn't involved.
+
+Each member gets one Jellyfin account, tracked separately from Audiobookshelf, so the same person can sign up to both. Usernames are compared ignoring case, the way Jellyfin does. Everything else (taken usernames, errors, closed DMs, removing the role) behaves as described for Audiobookshelf.
+
+### Setting it up
+
+1. **Make an API key** in Jellyfin under Dashboard, API Keys, then +. Jellyfin API keys have admin rights, so keep it to the bot.
+2. **Give it to the bot in a DM**, using the address the bot can reach:
+
+   ```
+   !set api jellyfin url http://<jellyfin-host>:8096 api_key <key>
+   ```
+3. **Turn it on and check it**, in the server:
+
+   ```
+   !rolegate add @Jellyfin open Jellyfin
+   !rolegate signup enable @Jellyfin jellyfin
+   !rolegate signup jellyfinlink https://<your-jellyfin-address>
+   !rolegate signup check
+   !rolegate refresh
+   ```
+
 ## What it stores
 
-Per Discord server: the approvals channel, the roles on the panel (mode, label, description, emoji), where the latest panel is, pending requests as user ID and role ID (plus the requested username for sign-up roles), the Audiobookshelf and Shelfarr addresses, and which Audiobookshelf username was made for which member. A pending request is removed once it's approved or denied. Red's "delete my data" removes a user's pending requests.
+Per Discord server: the approvals channel, the roles on the panel (mode, label, description, emoji), where the latest panel is, pending requests as user ID and role ID (plus the requested username for sign-up roles), the Audiobookshelf, Shelfarr and Jellyfin addresses, and which Audiobookshelf or Jellyfin username was made for which member. A pending request is removed once it's approved or denied. Red's "delete my data" removes a user's pending requests.

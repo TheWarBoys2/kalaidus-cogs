@@ -35,6 +35,9 @@ DANGEROUS_PERMS = (
 ABS_SERVICE = "audiobookshelf"
 # Optional: also make a Shelfarr account (for book requests) with the same login.
 SHELFARR_SERVICE = "shelfarr"
+# Jellyfin sign-up: same idea, under its own name.
+JELLYFIN_SERVICE = "jellyfin"
+SIGNUP_SERVICES = {ABS_SERVICE: "Audiobookshelf", JELLYFIN_SERVICE: "Jellyfin"}
 ABS_TIMEOUT = 15
 # Shelfarr only allows lowercase letters, numbers and underscores, so both accounts follow that.
 USERNAME_RE = re.compile(r"^[a-z0-9_]{3,32}$")
@@ -43,12 +46,24 @@ PASSWORD_ALPHABET = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 PASSWORD_LENGTH = 14
 
 
-class AbsError(Exception):
-    """Audiobookshelf couldn't create the account. The message is safe to show the approver."""
+class SignupError(Exception):
+    """The account couldn't be created. The message is safe to show the approver."""
 
 
-class AbsUsernameTaken(AbsError):
+class UsernameTaken(SignupError):
     pass
+
+
+def _signup_service(entry: dict) -> Optional[str]:
+    """Which service a role signs people up to, or None. Roles from before Jellyfin store True."""
+    signup = entry.get("signup")
+    if signup is True:
+        return ABS_SERVICE
+    return signup if signup in SIGNUP_SERVICES else None
+
+
+def _new_password() -> str:
+    return "".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(PASSWORD_LENGTH))
 
 
 def _pending_key(user_id: int, role_id: int) -> str:
@@ -131,7 +146,7 @@ class DecisionButton(
         await cog.handle_decision(interaction, self.action, self.user_id, self.role_id)
 
 
-class UsernameModal(discord.ui.Modal, title="Audiobookshelf sign-up"):
+class UsernameModal(discord.ui.Modal, title="Sign-up"):
     """Asks for the username to create when a sign-up role is approved."""
 
     username = discord.ui.TextInput(
@@ -141,8 +156,8 @@ class UsernameModal(discord.ui.Modal, title="Audiobookshelf sign-up"):
         max_length=32,
     )
 
-    def __init__(self, role_id: int) -> None:
-        super().__init__(timeout=600)
+    def __init__(self, role_id: int, service: str) -> None:
+        super().__init__(title=f"{SIGNUP_SERVICES[service]} sign-up", timeout=600)
         self.role_id = role_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -177,6 +192,8 @@ class RoleGate(commands.Cog):
             signup_link=None,  # address members use to reach Audiobookshelf, sent in the welcome DM
             signup_request_link=None,  # address members use to reach Shelfarr, sent in the welcome DM
             signups={},  # "<user_id>": Audiobookshelf username made for them, so each member gets one account
+            jellyfin_link=None,  # address members use to reach Jellyfin, sent in the welcome DM
+            jellyfin_signups={},  # "<user_id>": Jellyfin username made for them
         )
         self._locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -189,9 +206,10 @@ class RoleGate(commands.Cog):
     async def red_delete_data_for_user(self, *, requester, user_id: int) -> None:
         prefix = f"{user_id}:"
         for guild_id, data in (await self.config.all_guilds()).items():
-            if str(user_id) in data.get("signups", {}):
-                async with self.config.guild_from_id(guild_id).signups() as signups:
-                    signups.pop(str(user_id), None)
+            for name in ("signups", "jellyfin_signups"):
+                if str(user_id) in data.get(name, {}):
+                    async with getattr(self.config.guild_from_id(guild_id), name)() as signups:
+                        signups.pop(str(user_id), None)
             if not any(k.startswith(prefix) for k in data.get("pending", {})):
                 continue
             async with self.config.guild_from_id(guild_id).pending() as pending:
@@ -213,6 +231,11 @@ class RoleGate(commands.Cog):
         if role >= me.top_role:
             return "it's at or above my highest role. Move my role above it."
         return None
+
+    def _signups(self, guild: discord.Guild, service: str):
+        """The config value holding which username was made for which member on this service."""
+        conf = self.config.guild(guild)
+        return conf.jellyfin_signups if service == JELLYFIN_SERVICE else conf.signups
 
     async def _can_decide(self, user: Union[discord.Member, discord.User]) -> bool:
         if await self.bot.is_owner(user):
@@ -278,20 +301,20 @@ class RoleGate(commands.Cog):
 
         # Sign-up roles ask for a username first, unless we already made this member an account.
         # A modal has to be the first response, so no defer yet.
+        service = _signup_service(entry) if entry else None
         if (
-            entry is not None
+            service
             and role is not None
-            and entry.get("signup")
             and role not in member.roles
             and self._role_problem(guild, role) is None
-            and str(member.id) not in await conf.signups()
+            and str(member.id) not in await self._signups(guild, service)()
         ):
             if entry["mode"] == "approval" and _pending_key(member.id, role.id) in await conf.pending():
                 await interaction.response.send_message(
                     f"Your request for **{role.name}** is still waiting for a moderator.", ephemeral=True
                 )
                 return
-            await interaction.response.send_modal(UsernameModal(role.id))
+            await interaction.response.send_modal(UsernameModal(role.id, service))
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -357,36 +380,41 @@ class RoleGate(commands.Cog):
         if self._role_problem(guild, role):
             await send("I can't manage that role right now. Please let an admin know.", ephemeral=True)
             return
+        service = _signup_service(entry)
+        if service is None:
+            await send("That role doesn't make accounts any more. Click the button again.", ephemeral=True)
+            return
         if entry["mode"] == "approval":
-            await send(await self._create_request(guild, member, role, username), ephemeral=True)
+            await send(await self._create_request(guild, member, role, username, service), ephemeral=True)
             return
 
         # Open sign-up role: make the account and hand out the role straight away.
+        name = SIGNUP_SERVICES[service]
         async with self._locks[guild.id]:
-            if str(member.id) in await self.config.guild(guild).signups():
-                await send("You already have an Audiobookshelf account. Click the button again to get the role.", ephemeral=True)
+            if str(member.id) in await self._signups(guild, service)():
+                await send(f"You already have a {name} account. Click the button again to get the role.", ephemeral=True)
                 return
             try:
-                password, shelfarr = await self._create_accounts(username, member.display_name)
-            except AbsUsernameTaken:
+                password, shelfarr = await self._create_accounts(service, username, member.display_name)
+            except UsernameTaken:
                 await send(
                     f"The username **{username}** is already taken. Click the button again to pick another.",
                     ephemeral=True,
                 )
                 return
-            except AbsError as e:
-                log.warning("Audiobookshelf sign-up for %s failed: %s", member.id, e)
+            except SignupError as e:
+                log.warning("%s sign-up for %s failed: %s", name, member.id, e)
                 await send("I couldn't create your account right now. Please let an admin know.", ephemeral=True)
                 return
-            await self._record_signup(guild, member.id, username)
+            await self._record_signup(guild, service, member.id, username)
 
         try:
-            await member.add_roles(role, reason="RoleGate: Audiobookshelf sign-up")
+            await member.add_roles(role, reason=f"RoleGate: {name} sign-up")
             note = f"Your account is ready and you now have **{role.name}**."
         except discord.HTTPException:
             log.exception("Failed adding role %s to %s after sign-up", role.id, member.id)
             note = "Your account is ready, but I couldn't give you the role. Please let an admin know."
-        welcome = await self._welcome_text(guild, username, password, shelfarr)
+        welcome = await self._welcome_text(guild, service, username, password, shelfarr)
         try:
             await member.send(f"{note}\n\n{welcome}")
         except discord.HTTPException:
@@ -395,12 +423,17 @@ class RoleGate(commands.Cog):
             return
         await send(f"{note} I've sent your login by DM.", ephemeral=True)
 
-    async def _record_signup(self, guild: discord.Guild, user_id: int, username: str) -> None:
-        async with self.config.guild(guild).signups() as signups:
+    async def _record_signup(self, guild: discord.Guild, service: str, user_id: int, username: str) -> None:
+        async with self._signups(guild, service)() as signups:
             signups[str(user_id)] = username
 
     async def _create_request(
-        self, guild: discord.Guild, member: discord.Member, role: discord.Role, username: Optional[str] = None
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        role: discord.Role,
+        username: Optional[str] = None,
+        service: Optional[str] = None,
     ) -> str:
         conf = self.config.guild(guild)
         key = _pending_key(member.id, role.id)
@@ -426,8 +459,8 @@ class RoleGate(commands.Cog):
                 name="Joined server",
                 value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "Unknown",
             )
-            if username:
-                embed.add_field(name="Audiobookshelf username", value=f"`{username}`", inline=False)
+            if username and service:
+                embed.add_field(name=f"{SIGNUP_SERVICES[service]} username", value=f"`{username}`", inline=False)
             embed.set_thumbnail(url=member.display_avatar.url)
 
             view = discord.ui.View(timeout=None)
@@ -484,8 +517,10 @@ class RoleGate(commands.Cog):
 
             granted = False
             taken = False
-            account = None  # (username, password, shelfarr result) once an Audiobookshelf account exists
+            account = None  # (service, username, password, shelfarr result) once an account exists
             entry = (await conf.roles()).get(str(role_id)) or {}
+            service = _signup_service(entry)
+            service_name = SIGNUP_SERVICES.get(service, "account")
             if member is None:
                 outcome = "Member has left the server."
                 colour = discord.Colour.dark_grey()
@@ -503,19 +538,19 @@ class RoleGate(commands.Cog):
                 colour = discord.Colour.dark_grey()
             else:
                 username = info.get("username")
-                if entry.get("signup") and username:
+                if service and username:
                     try:
-                        account = (username, *await self._create_accounts(username, member.display_name))
-                        await self._record_signup(guild, user_id, username)
-                    except AbsUsernameTaken:
+                        account = (service, username, *await self._create_accounts(service, username, member.display_name))
+                        await self._record_signup(guild, service, user_id, username)
+                    except UsernameTaken:
                         taken = True
-                        outcome = f"Not granted: the Audiobookshelf username `{username}` is already taken."
+                        outcome = f"Not granted: the {service_name} username `{username}` is already taken."
                         colour = discord.Colour.dark_grey()
-                    except AbsError as e:
+                    except SignupError as e:
                         # Leave the request open so the approver can fix the problem and click Approve again.
-                        log.warning("Audiobookshelf sign-up for %s failed: %s", user_id, e)
+                        log.warning("%s sign-up for %s failed: %s", service_name, user_id, e)
                         await interaction.followup.send(
-                            f"I couldn't create the Audiobookshelf account: {e}\n"
+                            f"I couldn't create the {service_name} account: {e}\n"
                             "The request is still open, so you can click Approve again once that's fixed.",
                             ephemeral=True,
                         )
@@ -532,7 +567,7 @@ class RoleGate(commands.Cog):
                         outcome = f"Approved by {approver.mention}"
                         colour = discord.Colour.green()
                     if account:
-                        outcome += f"\nAudiobookshelf account `{account[0]}` created."
+                        outcome += f"\n{service_name} account `{account[1]}` created."
 
             if action == "deny" and member is None:
                 outcome = f"Denied by {approver.mention} (member has left the server)"
@@ -560,7 +595,7 @@ class RoleGate(commands.Cog):
             dm = f"Your request for **{role_name}** in **{guild.name}** was approved."
         elif taken:
             dm = (
-                f"The Audiobookshelf username **{info['username']}** is already taken, so your request for "
+                f"The {service_name} username **{info['username']}** is already taken, so your request for "
                 f"**{role_name}** in **{guild.name}** was closed. Click the button again to pick another."
             )
         elif action == "deny":
@@ -585,45 +620,53 @@ class RoleGate(commands.Cog):
                         allowed_mentions=NO_MENTIONS,
                     )
 
-    # ---------- Audiobookshelf ----------
+    # ---------- Audiobookshelf and Jellyfin ----------
 
-    async def _abs_request(self, method: str, path: str, json: Optional[dict] = None) -> aiohttp.ClientResponse:
-        tokens = await self.bot.get_shared_api_tokens(ABS_SERVICE)
+    async def _service_request(
+        self, service: str, method: str, path: str, json: Optional[dict] = None
+    ) -> aiohttp.ClientResponse:
+        name = SIGNUP_SERVICES[service]
+        tokens = await self.bot.get_shared_api_tokens(service)
         base, key = (tokens.get("url") or "").strip().rstrip("/"), (tokens.get("api_key") or "").strip()
         if not base or not key:
-            raise AbsError(
-                f"Audiobookshelf isn't set up. DM the bot: `!set api {ABS_SERVICE} url <url> api_key <key>`."
-            )
+            raise SignupError(f"{name} isn't set up. DM the bot: `!set api {service} url <url> api_key <key>`.")
+        if service == JELLYFIN_SERVICE:
+            headers = {"Authorization": f'MediaBrowser Token="{key}"'}
+        else:
+            headers = {"Authorization": f"Bearer {key}"}
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.request(
                     method,
                     base + path,
                     json=json,
-                    headers={"Authorization": f"Bearer {key}"},
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=ABS_TIMEOUT),
                 ) as resp:
                     await resp.read()
                     return resp
         except asyncio.TimeoutError:
-            raise AbsError(f"Audiobookshelf didn't answer within {ABS_TIMEOUT} seconds.") from None
+            raise SignupError(f"{name} didn't answer within {ABS_TIMEOUT} seconds.") from None
         except aiohttp.ClientError as e:
-            log.warning("Audiobookshelf unreachable: %s", e)
-            raise AbsError("Couldn't reach Audiobookshelf. Check the URL and that it's running.") from None
+            log.warning("%s unreachable: %s", name, e)
+            raise SignupError(f"Couldn't reach {name}. Check the URL and that it's running.") from None
 
     @staticmethod
-    async def _abs_check_status(resp: aiohttp.ClientResponse) -> None:
+    async def _check_status(service: str, resp: aiohttp.ClientResponse) -> None:
+        name = SIGNUP_SERVICES[service]
         if resp.status in (401, 403):
-            raise AbsError("Audiobookshelf rejected the API key. It has to belong to an admin account.")
+            if service == JELLYFIN_SERVICE:
+                raise SignupError("Jellyfin rejected the API key. Make one under Dashboard, API Keys.")
+            raise SignupError("Audiobookshelf rejected the API key. It has to belong to an admin account.")
         if resp.status == 404:
-            raise AbsError("Audiobookshelf returned 404. Is the URL the Audiobookshelf address, with no path?")
+            raise SignupError(f"{name} returned 404. Is the URL the {name} address, with no path?")
         if resp.status >= 400:
             text = (await resp.text())[:200]
-            raise AbsError(f"Audiobookshelf returned HTTP {resp.status}: {text}")
+            raise SignupError(f"{name} returned HTTP {resp.status}: {text}")
 
     async def _abs_create_user(self, username: str) -> str:
         """Create a normal Audiobookshelf user and return its password."""
-        password = "".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(PASSWORD_LENGTH))
+        password = _new_password()
         body = {
             "username": username,
             "password": password,
@@ -640,11 +683,36 @@ class RoleGate(commands.Cog):
                 "accessExplicitContent": True,
             },
         }
-        resp = await self._abs_request("POST", "/api/users", body)
+        resp = await self._service_request(ABS_SERVICE, "POST", "/api/users", body)
         if resp.status == 400 and "taken" in (await resp.text()).lower():
-            raise AbsUsernameTaken(username)
-        await self._abs_check_status(resp)
+            raise UsernameTaken(username)
+        await self._check_status(ABS_SERVICE, resp)
         log.info("Created Audiobookshelf user %s", username)
+        return password
+
+    async def _jellyfin_create_user(self, username: str) -> str:
+        """Create a normal Jellyfin user and return its password.
+
+        New users get Jellyfin's default policy: not an admin, and every library.
+        """
+        # Jellyfin names are case-insensitive. Check first, since its "already exists" error is a bare 400.
+        resp = await self._service_request(JELLYFIN_SERVICE, "GET", "/Users")
+        await self._check_status(JELLYFIN_SERVICE, resp)
+        try:
+            existing = {(u.get("Name") or "").lower() for u in await resp.json(content_type=None)}
+        except (ValueError, aiohttp.ContentTypeError):
+            raise SignupError("Jellyfin sent back something unexpected. Is the URL the Jellyfin address?") from None
+        if username in existing:
+            raise UsernameTaken(username)
+
+        password = _new_password()
+        resp = await self._service_request(
+            JELLYFIN_SERVICE, "POST", "/Users/New", {"Name": username, "Password": password}
+        )
+        if resp.status == 400 and "already exists" in (await resp.text()).lower():
+            raise UsernameTaken(username)
+        await self._check_status(JELLYFIN_SERVICE, resp)
+        log.info("Created Jellyfin user %s", username)
         return password
 
     async def _shelfarr_request(self, json: dict) -> Optional[aiohttp.ClientResponse]:
@@ -664,21 +732,24 @@ class RoleGate(commands.Cog):
                     await resp.read()
                     return resp
         except asyncio.TimeoutError:
-            raise AbsError(f"Shelfarr didn't answer within {ABS_TIMEOUT} seconds.") from None
+            raise SignupError(f"Shelfarr didn't answer within {ABS_TIMEOUT} seconds.") from None
         except aiohttp.ClientError as e:
             log.warning("Shelfarr unreachable: %s", e)
-            raise AbsError("Couldn't reach Shelfarr. Check the URL and that it's running.") from None
+            raise SignupError("Couldn't reach Shelfarr. Check the URL and that it's running.") from None
 
-    async def _create_accounts(self, username: str, name: str) -> Tuple[str, Optional[bool]]:
-        """Make the Audiobookshelf account, then the Shelfarr one if Shelfarr is set up.
+    async def _create_accounts(self, service: str, username: str, name: str) -> Tuple[str, Optional[bool]]:
+        """Make the account. For Audiobookshelf, also make the Shelfarr one if Shelfarr is set up.
 
-        Returns the password and whether the Shelfarr account was made (None if Shelfarr isn't set up).
-        A Shelfarr failure doesn't undo the Audiobookshelf account; it's logged and mentioned in the DM.
+        Returns the password and whether the Shelfarr account was made (None if Shelfarr isn't set up,
+        or for Jellyfin). A Shelfarr failure doesn't undo the Audiobookshelf account; it's logged and
+        mentioned in the DM.
         """
+        if service == JELLYFIN_SERVICE:
+            return await self._jellyfin_create_user(username), None
         password = await self._abs_create_user(username)
         try:
             resp = await self._shelfarr_request({"name": name[:100] or username, "username": username, "password": password})
-        except AbsError as e:
+        except SignupError as e:
             log.warning("Shelfarr account for %s not made: %s", username, e)
             return password, False
         if resp is None:
@@ -690,14 +761,24 @@ class RoleGate(commands.Cog):
         return password, False
 
     async def _welcome_text(
-        self, guild: discord.Guild, username: str, password: str, shelfarr: Optional[bool] = None
+        self, guild: discord.Guild, service: str, username: str, password: str, shelfarr: Optional[bool] = None
     ) -> str:
         conf = self.config.guild(guild)
-        link = await conf.signup_link()
-        lines = ["**Your Audiobookshelf login**"]
+        jellyfin = service == JELLYFIN_SERVICE
+        link = await (conf.jellyfin_link() if jellyfin else conf.signup_link())
+        lines = [f"**Your {SIGNUP_SERVICES[service]} login**"]
         if link:
             lines.append(f"Address: <{link}>")
         lines += [f"Username: `{username}`", f"Password: `{password}`", ""]
+        if jellyfin:
+            lines += [
+                "Watch in a web browser, or search for Jellyfin in your TV, phone or streaming stick's app store "
+                "and enter the address above.",
+                "",
+                "Please change your password after you first log in: click the person icon at the top right, "
+                "then Profile, and change it under Password.",
+            ]
+            return "\n".join(lines)
         if shelfarr:
             request_link = await conf.signup_request_link()
             where = f" at <{request_link}>" if request_link else ""
@@ -855,16 +936,23 @@ class RoleGate(commands.Cog):
         data = await self.config.guild(ctx.guild).all()
         channel = ctx.guild.get_channel(data["approval_channel"]) if data["approval_channel"] else None
         lines = [f"Approvals channel: {channel.mention if channel else 'not set'}"]
-        if any(e.get("signup") for e in data["roles"].values()):
+        services = {_signup_service(e) for e in data["roles"].values()}
+        if ABS_SERVICE in services:
             lines.append(f"Sign-up address in the welcome DM: {data['signup_link'] or 'not set'}")
             lines.append(f"Shelfarr address in the welcome DM: {data['signup_request_link'] or 'not set'}")
+        if JELLYFIN_SERVICE in services:
+            lines.append(f"Jellyfin address in the welcome DM: {data['jellyfin_link'] or 'not set'}")
         lines.append("")
         for role_id, entry in data["roles"].items():
             role = ctx.guild.get_role(int(role_id))
             where = role.mention if role else f"deleted role `{role_id}`"
             lock = LOCK_EMOJI + " " if entry["mode"] == "approval" else ""
             emoji = entry["emoji"] + " " if entry.get("emoji") else ""
-            signup = " \N{BOOKS} Audiobookshelf sign-up" if entry.get("signup") else ""
+            service = _signup_service(entry)
+            signup = {
+                ABS_SERVICE: " \N{BOOKS} Audiobookshelf sign-up",
+                JELLYFIN_SERVICE: " \N{CLAPPER BOARD} Jellyfin sign-up",
+            }.get(service, "")
             lines.append(f"{lock}{emoji}**{entry['label']}**: {where} (`{entry['mode']}`){signup}")
             if entry.get("description"):
                 lines.append(f"> {entry['description']}")
@@ -921,14 +1009,19 @@ class RoleGate(commands.Cog):
 
     @rolegate.group(name="signup")
     async def rolegate_signup(self, ctx: commands.Context) -> None:
-        """Create an Audiobookshelf account when a role is approved.
+        """Create an Audiobookshelf or Jellyfin account when someone picks a role.
 
         The member picks a username when they click the role, and gets their login by DM once it's approved.
         """
 
     @rolegate_signup.command(name="enable")
-    async def rolegate_signup_enable(self, ctx: commands.Context, role: discord.Role) -> None:
-        """Ask for a username on this role and create an Audiobookshelf account.
+    async def rolegate_signup_enable(
+        self,
+        ctx: commands.Context,
+        role: discord.Role,
+        service: Literal["audiobookshelf", "jellyfin"] = ABS_SERVICE,
+    ) -> None:
+        """Ask for a username on this role and create an account on `audiobookshelf` (default) or `jellyfin`.
 
         On an open role the account is made straight away; on an approval role, when it's approved.
         """
@@ -937,13 +1030,17 @@ class RoleGate(commands.Cog):
             if entry is None:
                 await ctx.send(f"That role isn't on the panel. Add it first with `{ctx.clean_prefix}rolegate add`.")
                 return
-            entry["signup"] = True
+            entry["signup"] = service
+        name = SIGNUP_SERVICES[service]
         when = "creates the account straight away" if entry["mode"] == "open" else "creates the account when you approve it"
-        msg = f"Clicking **{entry['label']}** now asks for an Audiobookshelf username and {when}."
-        tokens = await self.bot.get_shared_api_tokens(ABS_SERVICE)
+        msg = f"Clicking **{entry['label']}** now asks for a {name} username and {when}."
+        tokens = await self.bot.get_shared_api_tokens(service)
         if not tokens.get("url") or not tokens.get("api_key"):
-            msg += f"\n\N{WARNING SIGN} Audiobookshelf isn't set up yet. DM me: `{ctx.clean_prefix}set api {ABS_SERVICE} url <url> api_key <key>`."
-        if not await self.config.guild(ctx.guild).signup_link():
+            msg += f"\n\N{WARNING SIGN} {name} isn't set up yet. DM me: `{ctx.clean_prefix}set api {service} url <url> api_key <key>`."
+        conf = self.config.guild(ctx.guild)
+        if service == JELLYFIN_SERVICE and not await conf.jellyfin_link():
+            msg += f"\nSet the address members use with `{ctx.clean_prefix}rolegate signup jellyfinlink <url>` so it goes in their DM."
+        elif service == ABS_SERVICE and not await conf.signup_link():
             msg += f"\nSet the address members use with `{ctx.clean_prefix}rolegate signup link <url>` so it goes in their DM."
         await ctx.send(msg)
 
@@ -959,16 +1056,25 @@ class RoleGate(commands.Cog):
         await ctx.send(f"**{entry['label']}** is a normal approval role again.")
 
     @rolegate_signup.command(name="forget")
-    async def rolegate_signup_forget(self, ctx: commands.Context, member: Union[discord.Member, int]) -> None:
-        """Let a member sign up again, for example after you delete their Audiobookshelf account."""
+    async def rolegate_signup_forget(
+        self,
+        ctx: commands.Context,
+        member: Union[discord.Member, int],
+        service: Literal["audiobookshelf", "jellyfin"] = ABS_SERVICE,
+    ) -> None:
+        """Let a member sign up again, for example after you delete their account.
+
+        The service is `audiobookshelf` (default) or `jellyfin`.
+        """
         user_id = member.id if isinstance(member, discord.Member) else member
-        async with self.config.guild(ctx.guild).signups() as signups:
+        name = SIGNUP_SERVICES[service]
+        async with self._signups(ctx.guild, service)() as signups:
             username = signups.pop(str(user_id), None)
         if username is None:
-            await ctx.send("I haven't made an Audiobookshelf account for them.")
+            await ctx.send(f"I haven't made a {name} account for them.")
             return
         await ctx.send(
-            f"Forgot that <@{user_id}> has the account `{username}`. They'll be asked for a username next time. "
+            f"Forgot that <@{user_id}> has the {name} account `{username}`. They'll be asked for a username next time. "
             "This doesn't touch the account itself.",
             allowed_mentions=NO_MENTIONS,
         )
@@ -982,6 +1088,15 @@ class RoleGate(commands.Cog):
         await self.config.guild(ctx.guild).signup_link.set(url or None)
         await ctx.send(f"Welcome DMs will link to <{url}>." if url else "Welcome DMs won't include an address.")
 
+    @rolegate_signup.command(name="jellyfinlink")
+    async def rolegate_signup_jellyfinlink(self, ctx: commands.Context, url: Optional[str] = None) -> None:
+        """Set the Jellyfin address sent in the welcome DM. Leave it out to clear it."""
+        if url and not url.lower().startswith(("http://", "https://")):
+            await ctx.send("Give the full address, starting with http:// or https://.")
+            return
+        await self.config.guild(ctx.guild).jellyfin_link.set(url or None)
+        await ctx.send(f"Jellyfin welcome DMs will link to <{url}>." if url else "Jellyfin welcome DMs won't include an address.")
+
     @rolegate_signup.command(name="requestlink")
     async def rolegate_signup_requestlink(self, ctx: commands.Context, url: Optional[str] = None) -> None:
         """Set the Shelfarr address sent in the welcome DM. Leave it out to clear it."""
@@ -993,36 +1108,57 @@ class RoleGate(commands.Cog):
 
     @rolegate_signup.command(name="check")
     async def rolegate_signup_check(self, ctx: commands.Context) -> None:
-        """Check the bot can reach Audiobookshelf (and Shelfarr, if set up) with admin keys."""
+        """Check the bot can reach Audiobookshelf (and Shelfarr) and Jellyfin with admin keys.
+
+        Checks each service a role signs up to, or that has a key set.
+        """
+        roles = await self.config.guild(ctx.guild).roles()
+        services = {_signup_service(e) for e in roles.values()}
+        for service in SIGNUP_SERVICES:
+            tokens = await self.bot.get_shared_api_tokens(service)
+            if tokens.get("url") or tokens.get("api_key"):
+                services.add(service)
+        if not services & set(SIGNUP_SERVICES):
+            services.add(ABS_SERVICE)
         lines = []
         async with ctx.typing():
-            try:
-                await self._abs_check_status(await self._abs_request("GET", "/api/users"))
-                lines.append("\N{WHITE HEAVY CHECK MARK} Audiobookshelf is reachable and the key can create accounts.")
-            except AbsError as e:
-                lines.append(f"\N{CROSS MARK} {e}")
-            try:
-                # An empty user is rejected with 422 only after the key and its scope pass, so nothing is created.
-                resp = await self._shelfarr_request({})
-            except AbsError as e:
-                lines.append(f"\N{CROSS MARK} {e}")
-            else:
-                if resp is None:
-                    lines.append(
-                        "Shelfarr isn't set up, so only Audiobookshelf accounts are made. To add it, DM me: "
-                        f"`{ctx.clean_prefix}set api {SHELFARR_SERVICE} url <url> api_key <key>`."
-                    )
-                elif resp.status == 422:
-                    lines.append("\N{WHITE HEAVY CHECK MARK} Shelfarr is reachable and the key can create accounts.")
-                elif resp.status == 401:
-                    lines.append("\N{CROSS MARK} Shelfarr rejected the API key.")
-                elif resp.status == 403:
-                    lines.append(
-                        "\N{CROSS MARK} Shelfarr's key can't create users. Make it from an admin account "
-                        "with the `users:write` scope."
-                    )
+            if ABS_SERVICE in services:
+                try:
+                    await self._check_status(ABS_SERVICE, await self._service_request(ABS_SERVICE, "GET", "/api/users"))
+                    lines.append("\N{WHITE HEAVY CHECK MARK} Audiobookshelf is reachable and the key can create accounts.")
+                except SignupError as e:
+                    lines.append(f"\N{CROSS MARK} {e}")
+                try:
+                    # An empty user is rejected with 422 only after the key and its scope pass, so nothing is created.
+                    resp = await self._shelfarr_request({})
+                except SignupError as e:
+                    lines.append(f"\N{CROSS MARK} {e}")
                 else:
-                    lines.append(f"\N{CROSS MARK} Shelfarr returned HTTP {resp.status}. Is the URL Shelfarr's, with no path?")
+                    if resp is None:
+                        lines.append(
+                            "Shelfarr isn't set up, so only Audiobookshelf accounts are made. To add it, DM me: "
+                            f"`{ctx.clean_prefix}set api {SHELFARR_SERVICE} url <url> api_key <key>`."
+                        )
+                    elif resp.status == 422:
+                        lines.append("\N{WHITE HEAVY CHECK MARK} Shelfarr is reachable and the key can create accounts.")
+                    elif resp.status == 401:
+                        lines.append("\N{CROSS MARK} Shelfarr rejected the API key.")
+                    elif resp.status == 403:
+                        lines.append(
+                            "\N{CROSS MARK} Shelfarr's key can't create users. Make it from an admin account "
+                            "with the `users:write` scope."
+                        )
+                    else:
+                        lines.append(f"\N{CROSS MARK} Shelfarr returned HTTP {resp.status}. Is the URL Shelfarr's, with no path?")
+            if JELLYFIN_SERVICE in services:
+                try:
+                    # Listing users needs an admin key, the same as creating them.
+                    await self._check_status(
+                        JELLYFIN_SERVICE, await self._service_request(JELLYFIN_SERVICE, "GET", "/Users")
+                    )
+                    lines.append("\N{WHITE HEAVY CHECK MARK} Jellyfin is reachable and the key can create accounts.")
+                except SignupError as e:
+                    lines.append(f"\N{CROSS MARK} {e}")
         await ctx.send("\n".join(lines))
 
     @rolegate.command(name="pending")
